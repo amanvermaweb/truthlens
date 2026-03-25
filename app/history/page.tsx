@@ -1,4 +1,5 @@
 import { connectToDatabase } from "@/lib/mongodb";
+import { connection } from "next/server";
 
 type HistoryRecord = {
   id: string;
@@ -24,38 +25,44 @@ function formatRelativeTime(value: Date) {
 }
 
 async function getHistoryRecords() {
-  const client = await connectToDatabase();
-  const db = client.db("truth-lens");
-  const docs = await db
-    .collection("claims")
-    .find(
-      {},
-      {
-        projection: {
-          claim: 1,
-          verdict: 1,
-          confidence: 1,
-          createdAt: 1,
+  try {
+    const client = await connectToDatabase();
+    const db = client.db("truth-lens");
+    const docs = await db
+      .collection("claims")
+      .find(
+        {},
+        {
+          projection: {
+            claim: 1,
+            verdict: 1,
+            confidence: 1,
+            createdAt: 1,
+          },
         },
-      },
-    )
-    .sort({ createdAt: -1 })
-    .limit(50)
-    .toArray();
+      )
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .toArray();
 
-  return docs.map((entry) => ({
-    id: entry._id.toString(),
-    claim: String(entry.claim ?? "Untitled claim"),
-    verdict: String(entry.verdict ?? "Mixed"),
-    confidence: Number(entry.confidence ?? 0),
-    createdAt:
-      entry.createdAt instanceof Date
-        ? entry.createdAt
-        : new Date(entry.createdAt ?? Date.now()),
-  })) as HistoryRecord[];
+    return docs.map((entry) => ({
+      id: entry._id.toString(),
+      claim: String(entry.claim ?? "Untitled claim"),
+      verdict: String(entry.verdict ?? "Mixed"),
+      confidence: Number(entry.confidence ?? 0),
+      createdAt:
+        entry.createdAt instanceof Date
+          ? entry.createdAt
+          : new Date(entry.createdAt ?? Date.now()),
+    })) as HistoryRecord[];
+  } catch (error) {
+    console.error("Failed to load history records", error);
+    return [];
+  }
 }
 
 export default async function HistoryPage() {
+  await connection();
   const records = await getHistoryRecords();
 
   return (

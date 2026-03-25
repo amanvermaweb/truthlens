@@ -1,7 +1,6 @@
-
 # TruthLens
 
-TruthLens is a Next.js 16 app for claim verification workflows. Users submit a claim, the API evaluates supporting/contradicting evidence, stores the analysis in MongoDB, and renders results on the dashboard and history views.
+TruthLens is an app for claim verification workflows. Users submit a claim, the API evaluates supporting/contradicting evidence, stores the analysis in MongoDB, and renders results on the dashboard and history views.
 
 ## Features
 
@@ -14,29 +13,15 @@ TruthLens is a Next.js 16 app for claim verification workflows. Users submit a c
 
 ## Tech Stack
 
-- Next.js 16 (App Router)
-- React 19
+- Next.js
 - TypeScript
-- MongoDB Node driver
+- MongoDB
 - Clerk
-- Tailwind CSS 4
+- Tailwind CSS
 
 ## Environment Variables
 
-Create `.env.local` with:
-
-```bash
-MONGODB_URI=mongodb+srv://<user>:<password>@<cluster>/<db>?retryWrites=true&w=majority
-
-# Optional: enables external source enrichment in POST /api/facts
-NEWS_API_KEY=your_newsapi_key
-
-# Clerk (if auth is enabled in your environment)
-NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=...
-CLERK_SECRET_KEY=...
-```
-
-`MONGODB_URI` is required. The app throws a startup error if it is missing.
+Refer to [.env.local](.env.example)
 
 ## Run Locally
 
@@ -57,7 +42,7 @@ Request body:
 
 ```json
 {
-	"claim": "Shipping delays in Q3 were driven by localized port strikes."
+  "claim": "Shipping delays in Q3 were driven by localized port strikes."
 }
 ```
 
@@ -65,16 +50,16 @@ Response:
 
 ```json
 {
-	"claimId": "...",
-	"claim": {
-		"id": "...",
-		"claim": "...",
-		"verdict": "Likely True",
-		"confidence": 87,
-		"analysisSummary": "...",
-		"tags": ["Economy"],
-		"sourceNodes": []
-	}
+  "claimId": "...",
+  "claim": {
+    "id": "...",
+    "claim": "...",
+    "verdict": "Likely True",
+    "confidence": 87,
+    "analysisSummary": "...",
+    "tags": ["Economy"],
+    "sourceNodes": []
+  }
 }
 ```
 
