@@ -1,36 +1,98 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
-## Getting Started
+# TruthLens
 
-First, run the development server:
+TruthLens is a Next.js 16 app for claim verification workflows. Users submit a claim, the API evaluates supporting/contradicting evidence, stores the analysis in MongoDB, and renders results on the dashboard and history views.
+
+## Features
+
+- End-to-end claim flow: `/` -> `POST /api/facts` -> `/dashboard?claimId=...`
+- MongoDB-backed persistence for claim analyses
+- Dashboard with verdict, confidence score, evidence graph, and source cards
+- History archive sourced from saved claim records
+- Clerk auth-ready layout and top navigation
+- Optional NewsAPI enrichment for external source discovery
+
+## Tech Stack
+
+- Next.js 16 (App Router)
+- React 19
+- TypeScript
+- MongoDB Node driver
+- Clerk
+- Tailwind CSS 4
+
+## Environment Variables
+
+Create `.env.local` with:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+MONGODB_URI=mongodb+srv://<user>:<password>@<cluster>/<db>?retryWrites=true&w=majority
+
+# Optional: enables external source enrichment in POST /api/facts
+NEWS_API_KEY=your_newsapi_key
+
+# Clerk (if auth is enabled in your environment)
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=...
+CLERK_SECRET_KEY=...
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+`MONGODB_URI` is required. The app throws a startup error if it is missing.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Run Locally
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm install
+npm run dev
+```
 
-## Learn More
+Open `http://localhost:3000`.
 
-To learn more about Next.js, take a look at the following resources:
+## API
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### `POST /api/facts`
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Creates a new claim analysis.
 
-## Deploy on Vercel
+Request body:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```json
+{
+	"claim": "Shipping delays in Q3 were driven by localized port strikes."
+}
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Response:
+
+```json
+{
+	"claimId": "...",
+	"claim": {
+		"id": "...",
+		"claim": "...",
+		"verdict": "Likely True",
+		"confidence": 87,
+		"analysisSummary": "...",
+		"tags": ["Economy"],
+		"sourceNodes": []
+	}
+}
+```
+
+### `GET /api/facts`
+
+Returns latest claim analysis.
+
+### `GET /api/facts?claimId=<id>`
+
+Returns one claim analysis by MongoDB id.
+
+### `GET /api/facts?history=1`
+
+Returns a list of historical claim summaries.
+
+## Scripts
+
+- `npm run dev` - development server
+- `npm run build` - production build
+- `npm run start` - production server
+- `npm run lint` - eslint checks

@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 
 type SourceNode = {
   id: string;
@@ -14,52 +16,16 @@ type SourceNode = {
   y: number;
 };
 
-const sourceNodes: SourceNode[] = [
-  {
-    id: "reuters",
-    label: "Reuters",
-    title: "Quarterly Logistics & Port Congestion Index (Q3 2023)",
-    source: "Reuters Intelligence",
-    credibility: 95,
-    relation: "supports",
-    summary: "Confirms localized strike concentration in two terminal clusters.",
-    x: 28,
-    y: 22,
-  },
-  {
-    id: "world-bank",
-    label: "World Bank",
-    title: "Global Trade Bulletin - Disruption Pattern Review",
-    source: "World Bank Data",
-    credibility: 91,
-    relation: "supports",
-    summary: "Shows systemic markers below long-term disruption threshold.",
-    x: 75,
-    y: 26,
-  },
-  {
-    id: "audit-bureau",
-    label: "Audit Bureau",
-    title: "Independent Terminal Throughput Audit",
-    source: "Port Audit Bureau",
-    credibility: 89,
-    relation: "supports",
-    summary: "Throughput decline is uneven and concentrated near strike windows.",
-    x: 28,
-    y: 74,
-  },
-  {
-    id: "local-oped",
-    label: "Local Op-Ed",
-    title: "The End of Global Supply Chains",
-    source: "Regional Editorial",
-    credibility: 42,
-    relation: "contradicts",
-    summary: "High rhetoric, weak citation trail, broad unsupported claims.",
-    x: 72,
-    y: 76,
-  },
-];
+type ClaimPayload = {
+  id: string;
+  claim: string;
+  verdict: "Likely True" | "Mixed" | "Likely False";
+  confidence: number;
+  analysisSummary: string;
+  tags: string[];
+  sourceNodes: SourceNode[];
+  createdAt: string;
+};
 
 function reliabilityTone(score: number) {
   if (score >= 80) return "text-emerald-300 bg-emerald-500/10";
@@ -67,15 +33,51 @@ function reliabilityTone(score: number) {
   return "text-rose-300 bg-rose-500/10";
 }
 
+function verdictTone(verdict: ClaimPayload["verdict"]) {
+  if (verdict === "Likely True") return "bg-emerald-500/10 text-emerald-300";
+  if (verdict === "Likely False") return "bg-rose-500/10 text-rose-300";
+  return "bg-amber-500/10 text-amber-300";
+}
+
 export default function DashboardPage() {
+  const searchParams = useSearchParams();
+  const claimId = searchParams.get("claimId");
+
   const [loading, setLoading] = useState(true);
+  const [claimData, setClaimData] = useState<ClaimPayload | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [activeNode, setActiveNode] = useState<SourceNode | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
-    const timer = setTimeout(() => setLoading(false), 1200);
-    return () => clearTimeout(timer);
-  }, []);
+    const fetchClaim = async () => {
+      try {
+        setLoading(true);
+        setError(null);
+
+        const url = claimId ? `/api/facts?claimId=${claimId}` : "/api/facts";
+        const response = await fetch(url, { cache: "no-store" });
+        const payload = (await response.json().catch(() => null)) as
+          | { claim?: ClaimPayload | null; error?: string }
+          | null;
+
+        if (!response.ok) {
+          throw new Error(payload?.error || "Failed to fetch claim data");
+        }
+
+        setClaimData(payload?.claim ?? null);
+      } catch (error) {
+        setError(error instanceof Error ? error.message : "Unable to load data");
+        setClaimData(null);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchClaim();
+  }, [claimId]);
+
+  const sourceNodes = useMemo(() => claimData?.sourceNodes ?? [], [claimData?.sourceNodes]);
 
   const groupedCards = useMemo(
     () =>
@@ -86,8 +88,26 @@ export default function DashboardPage() {
           ...node,
           expanded: !!expanded[node.id],
         })),
-    [expanded],
+    [expanded, sourceNodes],
   );
+
+  if (!loading && !claimData) {
+    return (
+      <section className="mx-auto w-full max-w-240 px-4 pb-16 pt-8 sm:px-6 lg:px-8">
+        <article className="glass-panel p-8 sm:p-10">
+          <p className="label-sm text-muted">Analysis Engine</p>
+          <h1 className="headline-md mt-3 text-high">No verification available yet</h1>
+          <p className="body-md mt-3 text-muted">
+            Submit a claim from the home page to generate a fact-check report.
+          </p>
+          {error ? <p className="mt-2 text-sm text-rose-300">{error}</p> : null}
+          <Link href="/" className="btn-primary mt-6 h-11 px-5 text-sm">
+            Start Verification
+          </Link>
+        </article>
+      </section>
+    );
+  }
 
   return (
     <section className="mx-auto w-full max-w-350 px-4 pb-16 pt-8 sm:px-6 lg:px-8">
@@ -98,7 +118,9 @@ export default function DashboardPage() {
             Evidence Connectivity Dashboard
           </h1>
         </div>
-        <button className="btn-primary h-11 px-5 text-sm">New Verification</button>
+        <Link href="/" className="btn-primary h-11 px-5 text-sm">
+          New Verification
+        </Link>
       </div>
 
       {loading ? (
@@ -134,17 +156,11 @@ export default function DashboardPage() {
               Extracted Claim
             </p>
             <p className="headline-md mt-3 leading-tight text-high">
-              Global supply chain disruption in Q3 was driven by localized port
-              strikes, not systemic collapse.
+              {claimData?.claim}
             </p>
 
             <div className="mt-5 flex flex-wrap gap-2">
-              {[
-                "Economy",
-                "International",
-                "Logistics",
-                "Trade",
-              ].map((tag) => (
+              {(claimData?.tags ?? ["General"]).map((tag) => (
                 <span
                   key={tag}
                   className="rounded-full bg-(--surface-container-high) px-3 py-1 text-xs text-high"
@@ -154,13 +170,13 @@ export default function DashboardPage() {
               ))}
             </div>
 
-            <div className="mt-6 rounded-2xl bg-emerald-500/10 px-4 py-3 text-sm font-medium text-emerald-300">
-              Likely True
+            <div className={`mt-6 rounded-2xl px-4 py-3 text-sm font-medium ${claimData ? verdictTone(claimData.verdict) : ""}`}>
+              {claimData?.verdict}
             </div>
 
             <div className="mt-6 rounded-2xl bg-(--surface-container-lowest) p-4">
               <div className="mx-auto grid h-28 w-28 place-items-center rounded-full bg-(--surface-container-low) ring-4 ring-(--accent)/35">
-                <span className="headline-md text-high">94%</span>
+                <span className="headline-md text-high">{claimData?.confidence ?? 0}%</span>
               </div>
               <p className="label-sm mt-3 text-center text-muted">
                 Confidence
@@ -168,8 +184,7 @@ export default function DashboardPage() {
             </div>
 
             <div className="insight-panel mt-6 p-4 text-sm leading-6 text-muted">
-              Analysis of 14 independent logistics reports confirms an 82%
-              correlation with localized strike activity.
+              {claimData?.analysisSummary}
             </div>
           </aside>
 
@@ -217,6 +232,12 @@ export default function DashboardPage() {
                 </button>
               ))}
 
+              {sourceNodes.length === 0 ? (
+                <div className="absolute inset-0 grid place-items-center px-6 text-center text-sm text-muted">
+                  No supporting sources were generated for this claim.
+                </div>
+              ) : null}
+
               <div className="pulse-node absolute left-1/2 top-[52%] grid h-24 w-24 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full bg-(--accent)/10 text-sm font-semibold text-high">
                 Claim
               </div>
@@ -235,7 +256,9 @@ export default function DashboardPage() {
             </div>
 
             <p className="label-sm mt-4 text-muted">
-              Graph animates based on confidence drift and source latency.
+              {error
+                ? `Refresh issue: ${error}`
+                : "Graph positions are generated from source relevance and confidence drift."}
             </p>
           </main>
 
