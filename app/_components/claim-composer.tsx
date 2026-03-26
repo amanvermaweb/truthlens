@@ -3,6 +3,13 @@
 import { useRouter } from "next/navigation";
 import { FormEvent, useState } from "react";
 
+const MIN_CLAIM_LENGTH = 8;
+
+type CreateClaimResponse = {
+  claimId?: string;
+  error?: string;
+};
+
 type ClaimComposerProps = {
   className?: string;
 };
@@ -13,7 +20,7 @@ export function ClaimComposer({ className }: ClaimComposerProps) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const isDisabled = submitting || claim.trim().length < 8;
+  const isDisabled = submitting || claim.trim().length < MIN_CLAIM_LENGTH;
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -34,9 +41,7 @@ export function ClaimComposer({ className }: ClaimComposerProps) {
         body: JSON.stringify({ claim: trimmedClaim }),
       });
 
-      const payload = (await response.json().catch(() => null)) as
-        | { claimId?: string; error?: string }
-        | null;
+      const payload = (await response.json().catch(() => null)) as CreateClaimResponse | null;
 
       if (!response.ok || !payload?.claimId) {
         throw new Error(payload?.error || "Failed to analyze claim.");
@@ -54,7 +59,10 @@ export function ClaimComposer({ className }: ClaimComposerProps) {
 
   return (
     <div className={`hero-grid w-full p-5 sm:p-8 ${className ?? ""}`}>
-      <form className="relative flex flex-col gap-4 sm:flex-row sm:items-end" onSubmit={onSubmit}>
+      <form
+        className="relative flex flex-col gap-4 sm:flex-row sm:items-end"
+        onSubmit={onSubmit}
+      >
         <div className="w-full">
           <label htmlFor="claim-input" className="sr-only">
             Paste a claim or article
@@ -64,12 +72,16 @@ export function ClaimComposer({ className }: ClaimComposerProps) {
             rows={4}
             value={claim}
             onChange={(event) => setClaim(event.target.value)}
-            placeholder="Paste a claim or article..."
+            placeholder="Paste a claim or URL to analyze..."
             className="hero-input min-h-37.5 w-full resize-none py-4 text-base text-high outline-none placeholder:text-muted"
           />
           {error ? <p className="mt-2 text-sm text-rose-300">{error}</p> : null}
         </div>
-        <button type="submit" disabled={isDisabled} className="btn-primary h-12 min-w-36 px-6 disabled:opacity-70">
+        <button
+          type="submit"
+          disabled={isDisabled}
+          className="cursor-pointer btn-primary h-12 min-w-36 px-6 disabled:opacity-70"
+        >
           {submitting ? "Analyzing..." : "Analyze"}
         </button>
       </form>

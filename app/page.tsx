@@ -21,7 +21,6 @@ export default async function Home() {
         ) : null}
 
         <ClaimComposer className="mt-12" />
-
       </div>
     </section>
   );

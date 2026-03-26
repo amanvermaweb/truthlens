@@ -1,7 +1,6 @@
 @import "tailwindcss";
 
 :root {
-  /* Core palette */
   --surface: #121315;
   --surface-container-lowest: #0d0e10;
   --surface-container-low: #1b1c1e;
