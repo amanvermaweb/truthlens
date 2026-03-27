@@ -7,6 +7,11 @@ TruthLens is an app for claim verification workflows. Users submit a claim, the 
 - End-to-end claim flow: `/` -> `POST /api/facts` -> `/dashboard?claimId=...`
 - MongoDB-backed persistence across `users`, `queries`, and `results` collections
 - Dashboard with verdict, confidence score, evidence graph, and source cards
+- Multi-dimensional trust diagnostics: `Factual Accuracy`, `Source Agreement`, `Recency Score`, `Bias Risk`
+- Semantic claim decomposition into sub-claims with per-sub-claim support/contradiction counts
+- Bias and misinformation signaling (emotional language, manipulation risk, misleading segment extraction)
+- Tiered source trust model (Tier 1 institutions/research, Tier 2 major news, Tier 3 blogs)
+- Claim comparison mode for "arguments for" vs "arguments against" with a balanced verdict
 - History archive sourced from saved claim records
 - Clerk auth-ready layout and top navigation
 - Optional NewsAPI enrichment for external source discovery
@@ -96,7 +101,31 @@ Response includes:
 - `explanation`
 - `sources`
 - `confidence`
+- `dimensions` (`factualAccuracy`, `sourceAgreement`, `recencyScore`, `biasRisk`)
+- `biasProfile`
+- `misleadingSegments`
+- `subClaims`
 - `cached`
+
+### `POST /api/compare`
+
+Claim comparison mode endpoint.
+
+Request body:
+
+```json
+{
+  "claim": "AI will replace all jobs"
+}
+```
+
+Response includes:
+
+- `argumentsFor`
+- `argumentsAgainst`
+- `balancedVerdict`
+- `rationale`
+- `dimensions`
 
 ### `GET /api/history`
 

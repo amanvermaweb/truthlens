@@ -1,5 +1,5 @@
 import { auth } from "@clerk/nextjs/server";
-import { ClaimComposer } from "./_components/claim-composer";
+import { ClaimComposer } from "./components/claim-composer";
 
 export default async function Home() {
   const { userId } = await auth();

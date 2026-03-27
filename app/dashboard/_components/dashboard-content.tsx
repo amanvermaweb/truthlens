@@ -24,6 +24,11 @@ export function DashboardContent({ claimData, error }: DashboardContentProps) {
     [expanded, sourceNodes],
   );
 
+  const dimensions = claimData.dimensions;
+  const biasProfile = claimData.biasProfile;
+  const misleadingSegments = claimData.misleadingSegments ?? [];
+  const subClaims = claimData.subClaims ?? [];
+
   return (
     <div className="grid gap-4 lg:grid-cols-[280px_1fr_320px]">
       <aside className="glass-panel p-5">
@@ -57,6 +62,28 @@ export function DashboardContent({ claimData, error }: DashboardContentProps) {
         <div className="insight-panel mt-6 p-4 text-sm leading-6 text-muted">
           {claimData.analysisSummary}
         </div>
+
+        {dimensions ? (
+          <div className="mt-6 rounded-2xl bg-(--surface-container-lowest) p-4">
+            <p className="label-sm text-muted">Analysis Dimensions</p>
+            <div className="mt-3 space-y-2 text-sm text-high">
+              <p>Factual Accuracy: {dimensions.factualAccuracy}%</p>
+              <p>Source Agreement: {dimensions.sourceAgreement}%</p>
+              <p>Recency Score: {dimensions.recencyScore}%</p>
+              <p>Bias Risk: {dimensions.biasRisk}</p>
+            </div>
+          </div>
+        ) : null}
+
+        {biasProfile ? (
+          <div className="mt-4 rounded-2xl bg-(--surface-container-lowest) p-4 text-sm">
+            <p className="label-sm text-muted">Bias Detection</p>
+            <p className="mt-2 text-high">Political: {biasProfile.politicalBias}</p>
+            <p className="mt-1 text-high">Emotional Language: {biasProfile.emotionalLanguage}</p>
+            <p className="mt-1 text-high">Manipulation Risk: {biasProfile.manipulationRisk}</p>
+          </div>
+        ) : null}
+
       </aside>
 
       <main className="glass-panel relative overflow-hidden p-5">
@@ -133,6 +160,36 @@ export function DashboardContent({ claimData, error }: DashboardContentProps) {
             ? `Refresh issue: ${error}`
             : "Graph positions are generated from source relevance and confidence drift."}
         </p>
+
+        {subClaims.length > 0 ? (
+          <div className="mt-5 rounded-2xl bg-(--surface-container-lowest) p-4">
+            <h3 className="label-sm text-muted">Claim Decomposition</h3>
+            <div className="mt-3 space-y-3">
+              {subClaims.map((subClaim) => (
+                <article key={subClaim.id} className="rounded-xl bg-(--surface-container-low) p-3">
+                  <p className="text-sm text-high">{subClaim.statement}</p>
+                  <p className="mt-2 text-xs text-muted">
+                    Supports: {subClaim.supportCount} | Contradicts: {subClaim.contradictionCount} | Neutral: {subClaim.unresolvedCount}
+                  </p>
+                </article>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {misleadingSegments.length > 0 ? (
+          <div className="mt-5 rounded-2xl bg-(--surface-container-lowest) p-4">
+            <h3 className="label-sm text-muted">Misleading Language Signals</h3>
+            <div className="mt-3 space-y-2">
+              {misleadingSegments.map((segment) => (
+                <article key={`${segment.text}-${segment.reason}`} className="rounded-xl bg-(--surface-container-low) p-3">
+                  <p className="text-sm text-high">{segment.text}</p>
+                  <p className="mt-1 text-xs text-muted">{segment.reason}</p>
+                </article>
+              ))}
+            </div>
+          </div>
+        ) : null}
       </main>
 
       <aside className="glass-panel p-4">
@@ -147,6 +204,16 @@ export function DashboardContent({ claimData, error }: DashboardContentProps) {
                 >
                   {item.credibility}/100
                 </span>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-muted">
+                <span className="rounded-full bg-(--surface-container-high) px-2 py-0.5">
+                  {item.tier ?? "Tier ?"}
+                </span>
+                {typeof item.recencyScore === "number" ? (
+                  <span className="rounded-full bg-(--surface-container-high) px-2 py-0.5">
+                    Recency {item.recencyScore}%
+                  </span>
+                ) : null}
               </div>
               <h3 className="title-sm mt-2 leading-6 text-high">{item.title}</h3>
 

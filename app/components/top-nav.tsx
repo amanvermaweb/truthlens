@@ -10,6 +10,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 const links = [
+  { href: "/compare", label: "Compare" },
   { href: "/history", label: "History" },
   { href: "/about", label: "About" },
 ];

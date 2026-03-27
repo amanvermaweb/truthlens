@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { FormEvent, useState } from "react";
+import { type SubmitEvent, useState } from "react";
 
 const MIN_CLAIM_LENGTH = 8;
 
@@ -22,7 +22,7 @@ export function ClaimComposer({ className }: ClaimComposerProps) {
 
   const isDisabled = submitting || claim.trim().length < MIN_CLAIM_LENGTH;
 
-  async function onSubmit(event: FormEvent<HTMLFormElement>) {
+  async function onSubmit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
 

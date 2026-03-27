@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { ClerkProvider } from "@clerk/nextjs";
 import { Inter, Manrope } from "next/font/google";
-import { TopNav } from "./_components/top-nav";
+import { TopNav } from "./components/top-nav";
 import "./globals.css";
 
 const inter = Inter({
