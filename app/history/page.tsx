@@ -1,4 +1,4 @@
-import { HistoryCard } from "@/app/history/_components/history-card";
+import { HistoryCard } from "@/app/history/components/history-card";
 import { getHistory } from "@/lib/fact-check";
 import { HistoryRecord } from "@/lib/types";
 import { connection } from "next/server";

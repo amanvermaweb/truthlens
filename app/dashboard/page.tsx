@@ -1,8 +1,8 @@
 "use client";
 
-import { DashboardContent } from "@/app/dashboard/_components/dashboard-content";
-import { DashboardEmptyState } from "@/app/dashboard/_components/dashboard-empty-state";
-import { DashboardLoadingState } from "@/app/dashboard/_components/dashboard-loading-state";
+import { DashboardContent } from "@/app/dashboard/components/dashboard-content";
+import { DashboardEmptyState } from "@/app/dashboard/components/dashboard-empty-state";
+import { DashboardLoadingState } from "@/app/dashboard/components/dashboard-loading-state";
 import { ClaimPayload } from "@/lib/types";
 import Link from "next/link";
 import { useEffect, useState } from "react";
