@@ -1,12 +1,8 @@
 "use client";
 
+import { CompareApiResponse } from "@/lib/contracts";
 import { ComparisonResult } from "@/lib/types";
 import { type SubmitEvent, useState } from "react";
-
-type CompareApiResponse = {
-  comparison?: ComparisonResult;
-  error?: string;
-};
 
 export default function ComparePage() {
   const [claim, setClaim] = useState("");

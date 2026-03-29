@@ -1,8 +1,11 @@
 "use client";
 
-import { DashboardContent } from "@/app/dashboard/components/dashboard-content";
-import { DashboardEmptyState } from "@/app/dashboard/components/dashboard-empty-state";
-import { DashboardLoadingState } from "@/app/dashboard/components/dashboard-loading-state";
+import {
+  DashboardContent,
+  DashboardEmptyState,
+  DashboardLoadingState,
+} from "@/features/dashboard/components";
+import { FactsApiResponse } from "@/lib/contracts";
 import { ClaimPayload } from "@/lib/types";
 import Link from "next/link";
 import { useEffect, useState } from "react";
@@ -24,9 +27,7 @@ export default function DashboardPage() {
 
         const url = claimId ? `/api/facts?claimId=${claimId}` : "/api/facts";
         const response = await fetch(url, { cache: "no-store" });
-        const payload = (await response.json().catch(() => null)) as
-          | { claim?: ClaimPayload | null; error?: string }
-          | null;
+        const payload = (await response.json().catch(() => null)) as FactsApiResponse | null;
 
         if (!response.ok) {
           throw new Error(payload?.error || "Failed to fetch claim data");

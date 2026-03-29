@@ -25,6 +25,33 @@ TruthLens is an app for claim verification workflows. Users submit a claim, the 
 - Clerk
 - Tailwind CSS
 
+## Project Structure
+
+The codebase follows a route + feature split to keep routing concerns separate from reusable UI and domain logic.
+
+```text
+app/                  # Next.js routes, layouts, loading states, route handlers
+components/           # Shared cross-route UI (navigation, common shells)
+features/             # Feature-owned UI and client logic
+  home/
+  dashboard/
+  history/
+lib/
+  analysis/           # Scoring/input/source analysis helpers
+  contracts/          # Shared API request/response contracts
+  fact-check.ts       # Core fact-check orchestration
+  mongodb.ts          # Database connection
+  types.ts            # Domain types
+```
+
+Guidelines:
+
+- Keep `app/**` files thin: compose feature modules and avoid embedding large UI/logic blocks.
+- Put route-specific UI in `features/<feature>/components`.
+- Put cross-feature UI in `components/**`.
+- Define API payload contracts in `lib/contracts/**` and reuse them in both routes and clients.
+- Keep domain/data logic in `lib/**`, not in page components.
+
 ## Environment Variables
 
 Refer to [.env.local](.env.example)

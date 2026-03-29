@@ -1,5 +1,55 @@
 import { connectToDatabase } from "@/lib/mongodb";
 import {
+  commonKnowledgeAtomicNumberOverride,
+  commonKnowledgeBoilingPointOverride,
+  commonKnowledgeBornInOverride,
+  commonKnowledgeCapitalOverride,
+  commonKnowledgeCeoOverride,
+  commonKnowledgeDiedInOverride,
+  commonKnowledgeFounderOverride,
+  commonKnowledgeHeadquartersOverride,
+  commonKnowledgeLifeStatusOverride,
+  commonKnowledgeOrbitOverride,
+  commonKnowledgePresidentOverride,
+  commonKnowledgePrimeMinisterOverride,
+  commonKnowledgeScienceIsAOverride,
+  commonKnowledgeSpouseOverride,
+  commonKnowledgeUltraBasicOverride,
+} from "@/lib/fact-check/common-knowledge";
+import { createRunAnalysisPipeline } from "@/lib/fact-check/pipeline/run-analysis";
+import {
+  ClaimAssessment,
+  ClaimType,
+  ParsedClaim,
+} from "@/lib/fact-check/pipeline/types";
+import {
+  assessClaimForDecisiveMode,
+  buildDedupeKey,
+  clamp01,
+  classifyClaim,
+  classifyClaimType,
+  extractEntityCandidate,
+  getInputType,
+  hashValue,
+  normalizeInput,
+  parseClaimStructure,
+  parseInput,
+  rewriteClaimQueries,
+  tokenize,
+} from "@/lib/fact-check/claim-utils";
+import {
+  computeEvidenceQuality,
+  buildTrustModel,
+  domainAuthorityTier,
+  getDomainAuthority,
+} from "@/lib/fact-check/trust-utils";
+import {
+  computeAgreementScore,
+  detectStance,
+  evaluateRelation,
+  SourceStance,
+} from "@/lib/fact-check/stance-utils";
+import {
   AnalysisDimensions,
   BiasProfile,
   ComparisonResult,
@@ -11,23 +61,12 @@ import {
   Verdict,
 } from "@/lib/types";
 import { ObjectId } from "mongodb";
-import { createHash } from "node:crypto";
 
 const DB_NAME = process.env.MONGODB_DB_NAME ?? "truth-lens";
 const REQUEST_TIMEOUT_MS = 3000;
-const ANALYSIS_MODEL_VERSION = "v13";
+const ANALYSIS_MODEL_VERSION = "v15";
 
-type ParsedClaim = {
-  subject: string;
-  predicate: string;
-  object: string;
-};
-
-type ClaimType =
-  | "scientific"
-  | "political"
-  | "opinion"
-  | "statistical";
+export { classifyClaim, detectStance, getDomainAuthority };
 
 type RetrievalProfile = {
   relevanceThreshold: number;
@@ -48,26 +87,6 @@ const MIN_DOMAIN_AUTHORITY = 0.4;
 const MIN_RELAXED_SEMANTIC_THRESHOLD = 0.5;
 const MIN_RELAXED_RELEVANCE_THRESHOLD = 46;
 
-const KNOWN_CAPITALS: Record<string, string> = {
-  india: "new delhi",
-  france: "paris",
-  germany: "berlin",
-  italy: "rome",
-  spain: "madrid",
-  japan: "tokyo",
-  china: "beijing",
-  australia: "canberra",
-  canada: "ottawa",
-  brazil: "brasilia",
-  mexico: "mexico city",
-  egypt: "cairo",
-  russia: "moscow",
-  unitedstates: "washington dc",
-  unitedkingdom: "london",
-};
-
-type SourceStance = "support" | "contradict" | "neutral";
-
 type VerificationSourceScore = {
   relevanceScore: number;
   authorityScore: number;
@@ -78,25 +97,6 @@ type VerificationSourceScore = {
 };
 
 type VerificationVerdict = "TRUE" | "FALSE" | "MIXED" | "UNKNOWN";
-
-type BasicFactCategory = "geography" | "science" | "historical" | "general";
-
-type ClaimAssessment = {
-  isBasicFact: boolean;
-  category: BasicFactCategory;
-  decisivePrompt: string;
-  isHighCertaintyFact: boolean;
-  statusClaim: "dead" | "alive" | null;
-  needsVerification?: boolean;
-  verificationReason?: string;
-};
-
-type CommonKnowledgeResult = {
-  verdict: Verdict;
-  confidence: number;
-  explanation: string;
-  sources: SourceReference[];
-};
 
 type QueryDoc = {
   _id?: ObjectId;
@@ -137,15 +137,6 @@ type UserDoc = {
   clerkUserId: string;
   createdAt: Date;
   lastSeenAt: Date;
-};
-
-type SourceTier = "government" | "research" | "news" | "blog";
-
-const SOURCE_TIER_WEIGHT: Record<SourceTier, number> = {
-  government: 1.2,
-  research: 1.1,
-  news: 1,
-  blog: 0.75,
 };
 
 export type AnalysisResponse = {
@@ -194,1585 +185,6 @@ export type LegacyClaimResponse = {
   createdAt: Date;
   updatedAt?: Date;
 };
-
-function normalizeInput(value: string) {
-  return value.replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function hashValue(value: string) {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function buildDedupeKey(normalizedInput: string) {
-  return hashValue(`${ANALYSIS_MODEL_VERSION}:${normalizedInput}`);
-}
-
-function parseInput(payload: { claim?: unknown; input?: unknown; url?: unknown } | null) {
-  const inputCandidate =
-    typeof payload?.input === "string"
-      ? payload.input
-      : typeof payload?.claim === "string"
-        ? payload.claim
-        : typeof payload?.url === "string"
-          ? payload.url
-          : "";
-
-  const input = inputCandidate.trim();
-  if (!input) {
-    return { error: "Input is required" as const };
-  }
-
-  if (input.length > 1400) {
-    return { error: "Input is too long" as const };
-  }
-
-  return { input };
-}
-
-function getInputType(input: string): "text" | "url" {
-  try {
-    const parsed = new URL(input);
-    return parsed.protocol === "http:" || parsed.protocol === "https:" ? "url" : "text";
-  } catch {
-    return "text";
-  }
-}
-
-function clamp01(value: number) {
-  return Math.max(0, Math.min(1, value));
-}
-
-function tokenize(input: string) {
-  const stopwords = new Set([
-    "the",
-    "a",
-    "an",
-    "is",
-    "are",
-    "was",
-    "were",
-    "of",
-    "to",
-    "and",
-    "in",
-    "on",
-    "for",
-    "with",
-    "very",
-    "really",
-  ]);
-
-  return input
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter((token) => token.length > 2 && !stopwords.has(token));
-}
-
-function parseClaimStructure(input: string): ParsedClaim | null {
-  const cleaned = input.trim().replace(/\s+/g, " ");
-  const pattern = /^(.+?)\s+(is|are|was|were|has|have|can|cannot|can't|will|won't)\s+(.+?)\.?$/i;
-  const match = cleaned.match(pattern);
-
-  if (!match) {
-    return null;
-  }
-
-  const subject = match[1].trim();
-  const predicate = match[2].trim().toLowerCase();
-  const object = match[3].trim();
-
-  if (subject.length < 2 || object.length < 2) {
-    return null;
-  }
-
-  return { subject, predicate, object };
-}
-
-export function classifyClaim(claim: string): ClaimType {
-  const text = claim.toLowerCase();
-
-  if (/(i think|i feel|in my view|probably|best|worst|beautiful|ugly|overrated|underrated|amazing|terrible)/i.test(text)) {
-    return "opinion";
-  }
-
-  if (/(percent|%|rate|ratio|gdp|inflation|population|revenue|million|billion|trillion|\d)/i.test(text)) {
-    return "statistical";
-  }
-
-  if (/(election|policy|law|bill|senate|congress|parliament|government|campaign|president|prime minister)/i.test(text)) {
-    return "political";
-  }
-
-  return "scientific";
-}
-
-function classifyClaimType(inputText: string, parsedClaim: ParsedClaim | null): ClaimType {
-  const classified = classifyClaim(inputText);
-  if (classified !== "scientific") {
-    return classified;
-  }
-
-  const text = inputText.toLowerCase();
-
-  if (
-    /(vaccine|virus|disease|clinical|trial|study|medical|health|covid|mortality|orbit|planet|physics|chemistry|biology)/i.test(
-      text,
-    )
-  ) {
-    return "scientific";
-  }
-
-  if (parsedClaim && /(born|died|married|ceo|founder|president)/i.test(parsedClaim.object)) {
-    return "political";
-  }
-
-  return "scientific";
-}
-
-function detectBiographicalStatusClaim(inputText: string, parsedClaim: ParsedClaim | null): "dead" | "alive" | null {
-  const text = inputText.toLowerCase();
-  const combined = `${parsedClaim?.predicate ?? ""} ${parsedClaim?.object ?? ""}`.toLowerCase();
-
-  if (/\b(is|was|has been)\s+(dead|deceased)\b/.test(text) || /\b(died|deceased|dead)\b/.test(combined)) {
-    return "dead";
-  }
-
-  if (/\b(is|was|has been)\s+(alive|living)\b/.test(text) || /\b(alive|living)\b/.test(combined)) {
-    return "alive";
-  }
-
-  return null;
-}
-
-function assessClaimForDecisiveMode(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-  claimType: ClaimType,
-): ClaimAssessment {
-  const text = inputText.toLowerCase();
-  const hasHedging = /\b(maybe|might|possibly|probably|likely|unlikely|could|seems|appears)\b/i.test(text);
-  const hasFutureOrCounterfactual = /\b(will|would|could have|should have|if)\b/i.test(text);
-  const hasNormativeLanguage = /\b(should|ought|best|worst|good|bad|better|worse|right|wrong|overrated|underrated)\b/i.test(text);
-  const hasRumorSignal = /\b(rumor|alleged|reportedly|unconfirmed|claimed by social media|people say)\b/i.test(text);
-  const isDefinitional = parsedClaim ? /^(is|are|was|were|has|have)$/i.test(parsedClaim.predicate) : false;
-  const objectTokens = tokenize(parsedClaim?.object ?? "");
-  const shortObject = objectTokens.length > 0 && objectTokens.length <= 9;
-  const hasSubject = parsedClaim ? tokenize(parsedClaim.subject).length >= 1 : false;
-  const statusClaim = detectBiographicalStatusClaim(inputText, parsedClaim);
-
-  const geographySignal =
-    /\b(capital|continent|country|located in|largest ocean|highest mountain|river)\b/i.test(text) ||
-    /\bcapital\s+of\b/i.test(text);
-  const scienceSignal =
-    /\b(orbit|gravity|boils at|freezes at|photosynthesis|chemical|atomic number|planet|speed of light)\b/i.test(text);
-  const historicalSignal = /\b(born|died|founded|discovered|invented|independence|year)\b/i.test(text);
-
-  const category: BasicFactCategory = geographySignal
-    ? "geography"
-    : scienceSignal
-      ? "science"
-      : historicalSignal
-        ? "historical"
-        : "general";
-
-  const hasBasicSignal = geographySignal || scienceSignal || historicalSignal || statusClaim !== null;
-  const isBasicFact =
-    claimType !== "opinion" &&
-    !hasHedging &&
-    !hasFutureOrCounterfactual &&
-    isDefinitional &&
-    hasSubject &&
-    shortObject &&
-    hasBasicSignal;
-
-  const isHighCertaintyFact =
-    isBasicFact ||
-    (statusClaim !== null &&
-      claimType !== "opinion" &&
-      !hasHedging &&
-      !hasFutureOrCounterfactual &&
-      hasSubject);
-
-  const verificationReason =
-    claimType === "opinion"
-      ? "This appears to be a subjective or value-judgment claim."
-      : hasFutureOrCounterfactual
-        ? "This claim is predictive or counterfactual and cannot be decisively fact-checked from static evidence."
-        : hasRumorSignal
-          ? "This claim appears to be rumor-based and needs stronger confirmation."
-          : hasNormativeLanguage && !isBasicFact
-            ? "This claim is primarily normative and requires interpretation beyond factual verification."
-            : null;
-  const needsVerification = !isHighCertaintyFact && verificationReason !== null;
-
-  const decisivePrompt = isBasicFact
-    ? "Decisive mode: prioritize direct factual references and force a support-or-contradict outcome whenever evidence is non-neutral."
-    : "Balanced mode: aggregate support and contradiction signals and allow unresolved outcomes when evidence is weak.";
-
-  return {
-    isBasicFact,
-    category,
-    decisivePrompt,
-    isHighCertaintyFact,
-    statusClaim,
-    needsVerification,
-    verificationReason: verificationReason ?? undefined,
-  };
-}
-
-function rewriteClaimQueries(
-  claimText: string,
-  claimType: ClaimType,
-  parsedClaim: ParsedClaim | null,
-  assessment: ClaimAssessment,
-) {
-  const normalized = claimText.trim().replace(/\s+/g, " ");
-  const subject = parsedClaim?.subject?.trim() || extractEntityCandidate(claimText);
-  const object = parsedClaim?.object?.trim() || tokenize(claimText).slice(-3).join(" ");
-
-  const base = [
-    `Does ${normalized}`,
-    `${subject} ${parsedClaim?.predicate ?? ""} ${object} evidence`,
-    `${normalized} fact check`,
-  ];
-
-  const byType =
-    claimType === "statistical"
-      ? [`${normalized} official dataset`, `${subject} ${object} latest statistics`, `${normalized} source data`]
-      : claimType === "political"
-        ? [`${normalized} official statement`, `${normalized} policy record`, `${subject} ${object} verified reporting`]
-        : claimType === "opinion"
-          ? [`${normalized} objective evidence`, `${subject} ${object} measurable facts`, `${normalized} claim verification`]
-          : [
-              `${normalized} scientific proof`,
-              `${subject} ${object} peer reviewed evidence`,
-              `${normalized} explanation`,
-            ];
-
-  const decisive = assessment.isBasicFact
-    ? [
-        `${normalized} true or false`,
-        `${subject} ${parsedClaim?.predicate ?? "is"} ${object} confirmed or refuted`,
-        `${subject} ${object} official reference`,
-      ]
-    : [];
-
-  const simplified = assessment.isBasicFact
-    ? [
-        `${subject} ${object}`,
-        `${subject} fact`,
-        `${object} reference`,
-      ]
-    : [];
-
-  const capitalFallback = /\bcapital\b/i.test(claimText)
-    ? [`capital of ${subject}`, `${subject} capital city`, `${subject} official capital`]
-    : [];
-
-  return [...new Set([...base, ...byType, ...decisive, ...simplified, ...capitalFallback].map((item) => item.trim()).filter((item) => item.length > 6))].slice(0, 10);
-}
-
-function normalizeFactToken(value: string) {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\b(the|a|an)\b/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeCountryKey(value: string) {
-  return normalizeFactToken(value).replace(/\s+/g, "");
-}
-
-function getCapitalClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/\bcapital\s+of\s+(.+?)\s+(?:is|was)\s+(.+?)(?:[.!?]|$)/i);
-  if (direct) {
-    return {
-      country: direct[1].trim(),
-      claimedCapital: direct[2].trim(),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  const possessive = parsedClaim.subject.trim().match(/^(.+?)'?s\s+capital$/i);
-  if (!possessive) {
-    return null;
-  }
-
-  return {
-    country: possessive[1].trim(),
-    claimedCapital: parsedClaim.object.trim(),
-  };
-}
-
-function commonKnowledgeCapitalOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): CommonKnowledgeResult | null {
-  const parts = getCapitalClaimParts(inputText, parsedClaim);
-  if (!parts) {
-    return null;
-  }
-
-  const countryKey = normalizeCountryKey(parts.country)
-    .replace(/^the/, "")
-    .replace(/republicof/, "")
-    .replace(/federalrepublicof/, "");
-  const expectedCapital = KNOWN_CAPITALS[countryKey];
-  if (!expectedCapital) {
-    return null;
-  }
-
-  const claimedCapital = normalizeFactToken(parts.claimedCapital)
-    .replace(/\bcity\b/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  const normalizedExpected = normalizeFactToken(expectedCapital)
-    .replace(/\bcity\b/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  const isMatch = claimedCapital === normalizedExpected;
-  const countryLabel = parts.country.trim();
-  const expectedLabel = expectedCapital
-    .split(" ")
-    .map((item) => item.charAt(0).toUpperCase() + item.slice(1))
-    .join(" ");
-  const relation: SourceReference["relation"] = isMatch ? "supports" : "contradicts";
-
-  const sources: SourceReference[] = [
-    {
-      id: `ck-wikipedia-capital-${countryKey}`,
-      title: `${countryLabel} - Wikipedia`,
-      url: `https://en.wikipedia.org/wiki/${encodeURIComponent(countryLabel)}`,
-      publisher: "Wikipedia",
-      snippet: `The capital of ${countryLabel} is ${expectedLabel}.`,
-      relation,
-      credibility: 96,
-      tier: "Tier 1",
-      domainAuthorityTier: "High",
-      domainAuthority: 88,
-      institutionalTrust: 84,
-      citationSignal: 85,
-      recencyScore: 90,
-      agreementScore: isMatch ? 96 : 97,
-      relevanceScore: 98,
-      finalScore: 96,
-      authorityScore: 90,
-    },
-    {
-      id: `ck-worldfactbook-capital-${countryKey}`,
-      title: `${countryLabel} - The World Factbook`,
-      url: "https://www.cia.gov/the-world-factbook/",
-      publisher: "CIA World Factbook",
-      snippet: `Reference entries list ${expectedLabel} as the capital of ${countryLabel}.`,
-      relation,
-      credibility: 95,
-      tier: "Tier 1",
-      domainAuthorityTier: "High",
-      domainAuthority: 92,
-      institutionalTrust: 90,
-      citationSignal: 80,
-      recencyScore: 88,
-      agreementScore: isMatch ? 95 : 96,
-      relevanceScore: 96,
-      finalScore: 95,
-      authorityScore: 93,
-    },
-    {
-      id: `ck-britannica-capital-${countryKey}`,
-      title: `${countryLabel} - Britannica`,
-      url: `https://www.britannica.com/place/${encodeURIComponent(countryLabel)}`,
-      publisher: "Encyclopaedia Britannica",
-      snippet: `General reference material identifies ${expectedLabel} as the capital city.`,
-      relation,
-      credibility: 93,
-      tier: "Tier 1",
-      domainAuthorityTier: "High",
-      domainAuthority: 86,
-      institutionalTrust: 84,
-      citationSignal: 76,
-      recencyScore: 86,
-      agreementScore: isMatch ? 94 : 95,
-      relevanceScore: 95,
-      finalScore: 93,
-      authorityScore: 88,
-    },
-  ];
-
-  return {
-    verdict: isMatch ? "True" : "False",
-    confidence: isMatch ? 97 : 96,
-    explanation: isMatch
-      ? `Common-knowledge capital fact matched: the capital of ${countryLabel} is ${expectedLabel}.`
-      : `Common-knowledge capital fact contradicts the claim: the capital of ${countryLabel} is ${expectedLabel}.`,
-    sources,
-  };
-}
-
-function getCeoClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:is|was)\s+(?:the\s+)?ceo\s+of\s+(.+?)(?:[.!?]|$)/i);
-  if (direct) {
-    return {
-      claimedPerson: direct[1].trim(),
-      organization: direct[2].trim(),
-    };
-  }
-
-  const possessive = inputText
-    .trim()
-    .match(/^(.+?)'?s\s+ceo\s+(?:is|was)\s+(.+?)(?:[.!?]|$)/i);
-  if (possessive) {
-    return {
-      claimedPerson: possessive[2].trim(),
-      organization: possessive[1].trim(),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  if (!/\bceo\b/i.test(parsedClaim.object) && !/\bceo\b/i.test(parsedClaim.subject)) {
-    return null;
-  }
-
-  const parsedDirect = parsedClaim.object.match(/^(?:the\s+)?ceo\s+of\s+(.+)$/i);
-  if (parsedDirect) {
-    return {
-      claimedPerson: parsedClaim.subject.trim(),
-      organization: parsedDirect[1].trim(),
-    };
-  }
-
-  const parsedPossessive = parsedClaim.subject.match(/^(.+?)'?s\s+ceo$/i);
-  if (parsedPossessive) {
-    return {
-      claimedPerson: parsedClaim.object.trim(),
-      organization: parsedPossessive[1].trim(),
-    };
-  }
-
-  return null;
-}
-
-function getFounderClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:is|was)\s+(?:(?:the|a|an)\s+)?founder\s+of\s+(.+?)(?:[.!?]|$)/i);
-  if (direct) {
-    return {
-      claimedPerson: direct[1].trim(),
-      organization: direct[2].trim(),
-    };
-  }
-
-  const possessive = inputText
-    .trim()
-    .match(/^(.+?)'?s\s+founder\s+(?:is|was)\s+(.+?)(?:[.!?]|$)/i);
-  if (possessive) {
-    return {
-      claimedPerson: possessive[2].trim(),
-      organization: possessive[1].trim(),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  if (!/\bfounder\b/i.test(parsedClaim.object) && !/\bfounder\b/i.test(parsedClaim.subject)) {
-    return null;
-  }
-
-  const parsedDirect = parsedClaim.object.match(/^(?:the\s+)?founder\s+of\s+(.+)$/i);
-  if (parsedDirect) {
-    return {
-      claimedPerson: parsedClaim.subject.trim(),
-      organization: parsedDirect[1].trim(),
-    };
-  }
-
-  const parsedPossessive = parsedClaim.subject.match(/^(.+?)'?s\s+founder$/i);
-  if (parsedPossessive) {
-    return {
-      claimedPerson: parsedClaim.object.trim(),
-      organization: parsedPossessive[1].trim(),
-    };
-  }
-
-  return null;
-}
-
-function getPresidentClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:is|was)\s+(?:the\s+)?president\s+of\s+(.+?)(?:[.!?]|$)/i);
-  if (direct) {
-    return {
-      claimedPerson: direct[1].trim(),
-      entity: direct[2].trim(),
-    };
-  }
-
-  const possessive = inputText
-    .trim()
-    .match(/^(.+?)'?s\s+president\s+(?:is|was)\s+(.+?)(?:[.!?]|$)/i);
-  if (possessive) {
-    return {
-      claimedPerson: possessive[2].trim(),
-      entity: possessive[1].trim(),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  if (!/\bpresident\b/i.test(parsedClaim.object) && !/\bpresident\b/i.test(parsedClaim.subject)) {
-    return null;
-  }
-
-  const parsedDirect = parsedClaim.object.match(/^(?:the\s+)?president\s+of\s+(.+)$/i);
-  if (parsedDirect) {
-    return {
-      claimedPerson: parsedClaim.subject.trim(),
-      entity: parsedDirect[1].trim(),
-    };
-  }
-
-  const parsedPossessive = parsedClaim.subject.match(/^(.+?)'?s\s+president$/i);
-  if (parsedPossessive) {
-    return {
-      claimedPerson: parsedClaim.object.trim(),
-      entity: parsedPossessive[1].trim(),
-    };
-  }
-
-  return null;
-}
-
-function getPrimeMinisterClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:is|was)\s+(?:the\s+)?prime\s+minister\s+of\s+(.+?)(?:[.!?]|$)/i);
-  if (direct) {
-    return {
-      claimedPerson: direct[1].trim(),
-      entity: direct[2].trim(),
-    };
-  }
-
-  const possessive = inputText
-    .trim()
-    .match(/^(.+?)'?s\s+prime\s+minister\s+(?:is|was)\s+(.+?)(?:[.!?]|$)/i);
-  if (possessive) {
-    return {
-      claimedPerson: possessive[2].trim(),
-      entity: possessive[1].trim(),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  if (!/\bprime\s+minister\b/i.test(parsedClaim.object) && !/\bprime\s+minister\b/i.test(parsedClaim.subject)) {
-    return null;
-  }
-
-  const parsedDirect = parsedClaim.object.match(/^(?:the\s+)?prime\s+minister\s+of\s+(.+)$/i);
-  if (parsedDirect) {
-    return {
-      claimedPerson: parsedClaim.subject.trim(),
-      entity: parsedDirect[1].trim(),
-    };
-  }
-
-  const parsedPossessive = parsedClaim.subject.match(/^(.+?)'?s\s+prime\s+minister$/i);
-  if (parsedPossessive) {
-    return {
-      claimedPerson: parsedClaim.object.trim(),
-      entity: parsedPossessive[1].trim(),
-    };
-  }
-
-  return null;
-}
-
-function getHeadquartersClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:is|was)\s+headquartered\s+in\s+(.+?)(?:[.!?]|$)/i);
-  if (direct) {
-    return {
-      entity: direct[1].trim(),
-      claimedLocation: direct[2].trim(),
-    };
-  }
-
-  const inverse = inputText
-    .trim()
-    .match(/^headquarters\s+of\s+(.+?)\s+(?:is|was|are)\s+(.+?)(?:[.!?]|$)/i);
-  if (inverse) {
-    return {
-      entity: inverse[1].trim(),
-      claimedLocation: inverse[2].trim(),
-    };
-  }
-
-  const possessive = inputText
-    .trim()
-    .match(/^(.+?)'?s\s+headquarters\s+(?:is|was|are)\s+(.+?)(?:[.!?]|$)/i);
-  if (possessive) {
-    return {
-      entity: possessive[1].trim(),
-      claimedLocation: possessive[2].trim(),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  const parsedHeadquartered = parsedClaim.object.match(/^headquartered\s+in\s+(.+)$/i);
-  if (parsedHeadquartered) {
-    return {
-      entity: parsedClaim.subject.trim(),
-      claimedLocation: parsedHeadquartered[1].trim(),
-    };
-  }
-
-  const parsedInverse = parsedClaim.subject.match(/^headquarters\s+of\s+(.+)$/i);
-  if (parsedInverse) {
-    return {
-      entity: parsedInverse[1].trim(),
-      claimedLocation: parsedClaim.object.trim(),
-    };
-  }
-
-  return null;
-}
-
-function getBornInClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:is|was)?\s*born\s+in\s+(.+?)(?:[.!?]|$)/i);
-  if (direct) {
-    return {
-      person: direct[1].trim(),
-      claimedLocation: direct[2].trim(),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  const parsedDirect = parsedClaim.object.match(/^born\s+in\s+(.+)$/i);
-  if (parsedDirect) {
-    return {
-      person: parsedClaim.subject.trim(),
-      claimedLocation: parsedDirect[1].trim(),
-    };
-  }
-
-  return null;
-}
-
-function getDiedInClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:is|was)?\s*(?:died|dead)\s+in\s+(.+?)(?:[.!?]|$)/i);
-  if (direct) {
-    return {
-      person: direct[1].trim(),
-      claimedLocation: direct[2].trim(),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  const parsedDirect = parsedClaim.object.match(/^(?:died|dead)\s+in\s+(.+)$/i);
-  if (parsedDirect) {
-    return {
-      person: parsedClaim.subject.trim(),
-      claimedLocation: parsedDirect[1].trim(),
-    };
-  }
-
-  return null;
-}
-
-function getSpouseClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const directSpouse = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:is|was)\s+(?:the\s+)?spouse\s+of\s+(.+?)(?:[.!?]|$)/i);
-  if (directSpouse) {
-    return {
-      person: directSpouse[1].trim(),
-      claimedSpouse: directSpouse[2].trim(),
-    };
-  }
-
-  const marriedTo = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:is|was)\s+married\s+to\s+(.+?)(?:[.!?]|$)/i);
-  if (marriedTo) {
-    return {
-      person: marriedTo[1].trim(),
-      claimedSpouse: marriedTo[2].trim(),
-    };
-  }
-
-  const possessive = inputText
-    .trim()
-    .match(/^(.+?)'?s\s+spouse\s+(?:is|was)\s+(.+?)(?:[.!?]|$)/i);
-  if (possessive) {
-    return {
-      person: possessive[1].trim(),
-      claimedSpouse: possessive[2].trim(),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  const parsedSpouseOf = parsedClaim.object.match(/^(?:the\s+)?spouse\s+of\s+(.+)$/i);
-  if (parsedSpouseOf) {
-    return {
-      person: parsedClaim.subject.trim(),
-      claimedSpouse: parsedSpouseOf[1].trim(),
-    };
-  }
-
-  const parsedMarriedTo = parsedClaim.object.match(/^married\s+to\s+(.+)$/i);
-  if (parsedMarriedTo) {
-    return {
-      person: parsedClaim.subject.trim(),
-      claimedSpouse: parsedMarriedTo[1].trim(),
-    };
-  }
-
-  return null;
-}
-
-function getOrbitClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:revolves?|orbits?)\s+around\s+(.+?)(?:[.!?]|$)/i);
-  if (direct) {
-    return {
-      body: direct[1].trim(),
-      claimedCenter: direct[2].trim(),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  const parsedAround = parsedClaim.object.match(/^around\s+(.+)$/i);
-  if (parsedAround && /\b(revolve|orbit)\b/i.test(parsedClaim.predicate)) {
-    return {
-      body: parsedClaim.subject.trim(),
-      claimedCenter: parsedAround[1].trim(),
-    };
-  }
-
-  return null;
-}
-
-function getLifeStatusClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:is|was|has been)\s+(dead|deceased|alive|living)(?:[.!?]|$)/i);
-  if (direct) {
-    const status = /dead|deceased/i.test(direct[2]) ? "dead" : "alive";
-    return {
-      person: direct[1].trim(),
-      claimedStatus: status as "dead" | "alive",
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  const objectText = `${parsedClaim.predicate} ${parsedClaim.object}`.toLowerCase();
-  if (/\b(dead|deceased|died)\b/.test(objectText)) {
-    return {
-      person: parsedClaim.subject.trim(),
-      claimedStatus: "dead" as const,
-    };
-  }
-
-  if (/\b(alive|living)\b/.test(objectText)) {
-    return {
-      person: parsedClaim.subject.trim(),
-      claimedStatus: "alive" as const,
-    };
-  }
-
-  return null;
-}
-
-function normalizeEntityName(value: string) {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\b(the|inc|llc|ltd|corp|corporation|company|plc)\b/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeLocationName(value: string) {
-  return value
-    .toLowerCase()
-    .replace(/\(.*?\)/g, " ")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\b(the|city|state|province)\b/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-type WikidataEntitySearch = {
-  id: string;
-  label: string;
-};
-
-async function searchWikidataEntity(query: string): Promise<WikidataEntitySearch | null> {
-  const searchResponse = await fetchWithTimeout(
-    `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(query)}&language=en&format=json&limit=1&type=item`,
-  );
-  if (!searchResponse.ok) {
-    return null;
-  }
-
-  const payload = (await searchResponse.json()) as {
-    search?: Array<{ id?: string; label?: string }>;
-  };
-  const hit = payload.search?.[0];
-  if (!hit?.id) {
-    return null;
-  }
-
-  return {
-    id: hit.id,
-    label: hit.label ?? query,
-  };
-}
-
-async function getWikidataEntities(
-  ids: string[],
-  props: "claims|labels" | "labels" = "claims|labels",
-) {
-  if (ids.length === 0) {
-    return null;
-  }
-
-  const response = await fetchWithTimeout(
-    `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${encodeURIComponent(ids.join("|"))}&format=json&props=${encodeURIComponent(props)}`,
-  );
-  if (!response.ok) {
-    return null;
-  }
-
-  return (await response.json()) as {
-    entities?: Record<string, {
-      claims?: Record<string, Array<{
-        mainsnak?: { datavalue?: { value?: { id?: string } } };
-        rank?: string;
-      }>>;
-      labels?: Record<string, { value?: string }>;
-    }>;
-  };
-}
-
-function extractItemIdsFromClaims(
-  claims: Record<string, Array<{ mainsnak?: { datavalue?: { value?: { id?: string } } }; rank?: string }>> | undefined,
-  propertyId: string,
-) {
-  return (claims?.[propertyId] ?? [])
-    .filter((claim) => claim.rank !== "deprecated")
-    .map((claim) => claim.mainsnak?.datavalue?.value?.id)
-    .filter((value): value is string => typeof value === "string");
-}
-
-function hasWikidataClaim(
-  claims: Record<string, Array<{ mainsnak?: { datavalue?: { value?: { id?: string } } }; rank?: string }>> | undefined,
-  propertyId: string,
-) {
-  const entries = claims?.[propertyId] ?? [];
-  return entries.some((entry) => entry.rank !== "deprecated");
-}
-
-type StructuredPropertyOverrideConfig = {
-  id: string;
-  propertyId: string;
-  roleLabel: string;
-  sourcePropertyDescription: string;
-  parse: (inputText: string, parsedClaim: ParsedClaim | null) => { claimedValue: string; entity: string } | null;
-  normalizeClaimedValue: (value: string) => string;
-  normalizeExpectedValue: (value: string) => string;
-};
-
-type ScienceClassConfig = {
-  claimLabel: string;
-  qid: string;
-};
-
-const SCIENCE_CLASS_MAP: ScienceClassConfig[] = [
-  { claimLabel: "planet", qid: "Q634" },
-  { claimLabel: "star", qid: "Q523" },
-  { claimLabel: "moon", qid: "Q2537" },
-  { claimLabel: "galaxy", qid: "Q318" },
-  { claimLabel: "element", qid: "Q11344" },
-  { claimLabel: "chemical element", qid: "Q11344" },
-];
-
-function getScienceIsAClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/^(.+?)\s+(?:is|was)\s+(?:a|an|the)?\s*(planet|star|moon|galaxy|element|chemical element)(?:[.!?]|$)/i);
-  if (direct) {
-    return {
-      entity: direct[1].trim(),
-      claimedClass: direct[2].trim().toLowerCase(),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  const parsedObject = parsedClaim.object
-    .trim()
-    .toLowerCase()
-    .match(/^(?:a|an|the)?\s*(planet|star|moon|galaxy|element|chemical element)$/i);
-  if (!parsedObject) {
-    return null;
-  }
-
-  return {
-    entity: parsedClaim.subject.trim(),
-    claimedClass: parsedObject[1].trim().toLowerCase(),
-  };
-}
-
-function getAtomicNumberClaimParts(inputText: string, parsedClaim: ParsedClaim | null) {
-  const direct = inputText
-    .trim()
-    .match(/^(.+?)\s+has\s+(?:an\s+)?atomic\s+number\s+([0-9]{1,3})(?:[.!?]|$)/i);
-  if (direct) {
-    return {
-      entity: direct[1].trim(),
-      claimedAtomicNumber: Number.parseInt(direct[2], 10),
-    };
-  }
-
-  if (!parsedClaim) {
-    return null;
-  }
-
-  const parsedObject = parsedClaim.object
-    .trim()
-    .toLowerCase()
-    .match(/^(?:an\s+)?atomic\s+number\s+([0-9]{1,3})$/i);
-  if (!parsedObject) {
-    return null;
-  }
-
-  return {
-    entity: parsedClaim.subject.trim(),
-    claimedAtomicNumber: Number.parseInt(parsedObject[1], 10),
-  };
-}
-
-function extractNumericClaimValues(
-  claims: Record<string, Array<{ mainsnak?: { datavalue?: { value?: unknown } }; rank?: string }>> | undefined,
-  propertyId: string,
-) {
-  const entries = claims?.[propertyId] ?? [];
-  return entries
-    .filter((entry) => entry.rank !== "deprecated")
-    .map((entry) => {
-      const rawValue = entry.mainsnak?.datavalue?.value as { amount?: string | number } | undefined;
-      if (!rawValue || rawValue.amount === undefined || rawValue.amount === null) {
-        return null;
-      }
-
-      const parsed = Number.parseFloat(String(rawValue.amount));
-      if (!Number.isFinite(parsed)) {
-        return null;
-      }
-
-      return Math.round(Math.abs(parsed));
-    })
-    .filter((value): value is number => value !== null);
-}
-
-async function commonKnowledgeStructuredPropertyOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-  config: StructuredPropertyOverrideConfig,
-): Promise<CommonKnowledgeResult | null> {
-  const parts = config.parse(inputText, parsedClaim);
-  if (!parts) {
-    return null;
-  }
-
-  const entityName = parts.entity.trim();
-  const claimedValue = parts.claimedValue.trim();
-  if (!entityName || !claimedValue) {
-    return null;
-  }
-
-  try {
-    const entitySearch = await searchWikidataEntity(entityName);
-    if (!entitySearch) {
-      return null;
-    }
-
-    const entityPayload = await getWikidataEntities([entitySearch.id], "claims|labels");
-    const entityData = entityPayload?.entities?.[entitySearch.id];
-    if (!entityData?.claims) {
-      return null;
-    }
-
-    const propertyValueIds = [...new Set(extractItemIdsFromClaims(entityData.claims, config.propertyId))].slice(0, 5);
-    if (propertyValueIds.length === 0) {
-      return null;
-    }
-
-    const valuePayload = await getWikidataEntities(propertyValueIds, "labels");
-    const expectedValues = propertyValueIds
-      .map((id) => valuePayload?.entities?.[id]?.labels?.en?.value?.trim())
-      .filter((value): value is string => Boolean(value));
-
-    if (expectedValues.length === 0) {
-      return null;
-    }
-
-    const normalizedClaimed = config.normalizeClaimedValue(claimedValue);
-    const normalizedExpected = expectedValues.map(config.normalizeExpectedValue);
-    const isMatch = normalizedExpected.includes(normalizedClaimed);
-    const expectedPrimary = expectedValues[0];
-    const entityLabel = entityData.labels?.en?.value?.trim() || entitySearch.label || entityName;
-    const relation: SourceReference["relation"] = isMatch ? "supports" : "contradicts";
-
-    const sources: SourceReference[] = [
-      {
-        id: `ck-wikidata-${config.id}-${entitySearch.id}`,
-        title: `${entityLabel} - Wikidata (${config.roleLabel})`,
-        url: `https://www.wikidata.org/wiki/${entitySearch.id}`,
-        publisher: "Wikidata",
-        snippet: `${entityLabel} lists ${expectedPrimary} for ${config.roleLabel} via property ${config.propertyId} (${config.sourcePropertyDescription}).`,
-        relation,
-        credibility: 95,
-        tier: "Tier 1",
-        domainAuthorityTier: "High",
-        domainAuthority: 88,
-        institutionalTrust: 90,
-        citationSignal: 84,
-        recencyScore: 88,
-        agreementScore: isMatch ? 95 : 96,
-        relevanceScore: 97,
-        finalScore: 95,
-        authorityScore: 92,
-      },
-      {
-        id: `ck-wikipedia-${config.id}-${entitySearch.id}`,
-        title: `${entityLabel} reference`,
-        url: `https://en.wikipedia.org/wiki/${encodeURIComponent(entityLabel)}`,
-        publisher: "Wikipedia",
-        snippet: `${entityLabel} references indicate ${expectedPrimary} for ${config.roleLabel}.`,
-        relation,
-        credibility: 92,
-        tier: "Tier 1",
-        domainAuthorityTier: "High",
-        domainAuthority: 86,
-        institutionalTrust: 84,
-        citationSignal: 78,
-        recencyScore: 84,
-        agreementScore: isMatch ? 93 : 94,
-        relevanceScore: 94,
-        finalScore: 92,
-        authorityScore: 88,
-      },
-    ];
-
-    return {
-      verdict: isMatch ? "True" : "False",
-      confidence: isMatch ? 95 : 93,
-      explanation: isMatch
-        ? `Common-knowledge ${config.roleLabel} fact matched: ${expectedPrimary} is listed for ${entityLabel}.`
-        : `Common-knowledge ${config.roleLabel} fact contradicts the claim: ${entityLabel} lists ${expectedPrimary}.`,
-      sources,
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function commonKnowledgeCeoOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  return commonKnowledgeStructuredPropertyOverride(inputText, parsedClaim, {
-    id: "ceo",
-    propertyId: "P169",
-    roleLabel: "CEO",
-    sourcePropertyDescription: "chief executive officer",
-    parse: (text, parsed) => {
-      const parts = getCeoClaimParts(text, parsed);
-      if (!parts) {
-        return null;
-      }
-
-      return {
-        entity: parts.organization,
-        claimedValue: parts.claimedPerson,
-      };
-    },
-    normalizeClaimedValue: normalizeEntityName,
-    normalizeExpectedValue: normalizeEntityName,
-  });
-}
-
-async function commonKnowledgeFounderOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  return commonKnowledgeStructuredPropertyOverride(inputText, parsedClaim, {
-    id: "founder",
-    propertyId: "P112",
-    roleLabel: "founder",
-    sourcePropertyDescription: "founded by",
-    parse: (text, parsed) => {
-      const parts = getFounderClaimParts(text, parsed);
-      if (!parts) {
-        return null;
-      }
-
-      return {
-        entity: parts.organization,
-        claimedValue: parts.claimedPerson,
-      };
-    },
-    normalizeClaimedValue: normalizeEntityName,
-    normalizeExpectedValue: normalizeEntityName,
-  });
-}
-
-async function commonKnowledgePresidentOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  return commonKnowledgeStructuredPropertyOverride(inputText, parsedClaim, {
-    id: "president",
-    propertyId: "P35",
-    roleLabel: "president",
-    sourcePropertyDescription: "head of state",
-    parse: (text, parsed) => {
-      const parts = getPresidentClaimParts(text, parsed);
-      if (!parts) {
-        return null;
-      }
-
-      return {
-        entity: parts.entity,
-        claimedValue: parts.claimedPerson,
-      };
-    },
-    normalizeClaimedValue: normalizeEntityName,
-    normalizeExpectedValue: normalizeEntityName,
-  });
-}
-
-async function commonKnowledgePrimeMinisterOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  return commonKnowledgeStructuredPropertyOverride(inputText, parsedClaim, {
-    id: "prime-minister",
-    propertyId: "P6",
-    roleLabel: "prime minister",
-    sourcePropertyDescription: "head of government",
-    parse: (text, parsed) => {
-      const parts = getPrimeMinisterClaimParts(text, parsed);
-      if (!parts) {
-        return null;
-      }
-
-      return {
-        entity: parts.entity,
-        claimedValue: parts.claimedPerson,
-      };
-    },
-    normalizeClaimedValue: normalizeEntityName,
-    normalizeExpectedValue: normalizeEntityName,
-  });
-}
-
-async function commonKnowledgeHeadquartersOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  return commonKnowledgeStructuredPropertyOverride(inputText, parsedClaim, {
-    id: "headquarters",
-    propertyId: "P159",
-    roleLabel: "headquarters",
-    sourcePropertyDescription: "headquarters location",
-    parse: (text, parsed) => {
-      const parts = getHeadquartersClaimParts(text, parsed);
-      if (!parts) {
-        return null;
-      }
-
-      return {
-        entity: parts.entity,
-        claimedValue: parts.claimedLocation,
-      };
-    },
-    normalizeClaimedValue: normalizeLocationName,
-    normalizeExpectedValue: normalizeLocationName,
-  });
-}
-
-async function commonKnowledgeBornInOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  return commonKnowledgeStructuredPropertyOverride(inputText, parsedClaim, {
-    id: "born-in",
-    propertyId: "P19",
-    roleLabel: "place of birth",
-    sourcePropertyDescription: "place of birth",
-    parse: (text, parsed) => {
-      const parts = getBornInClaimParts(text, parsed);
-      if (!parts) {
-        return null;
-      }
-
-      return {
-        entity: parts.person,
-        claimedValue: parts.claimedLocation,
-      };
-    },
-    normalizeClaimedValue: normalizeLocationName,
-    normalizeExpectedValue: normalizeLocationName,
-  });
-}
-
-async function commonKnowledgeDiedInOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  return commonKnowledgeStructuredPropertyOverride(inputText, parsedClaim, {
-    id: "died-in",
-    propertyId: "P20",
-    roleLabel: "place of death",
-    sourcePropertyDescription: "place of death",
-    parse: (text, parsed) => {
-      const parts = getDiedInClaimParts(text, parsed);
-      if (!parts) {
-        return null;
-      }
-
-      return {
-        entity: parts.person,
-        claimedValue: parts.claimedLocation,
-      };
-    },
-    normalizeClaimedValue: normalizeLocationName,
-    normalizeExpectedValue: normalizeLocationName,
-  });
-}
-
-async function commonKnowledgeSpouseOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  return commonKnowledgeStructuredPropertyOverride(inputText, parsedClaim, {
-    id: "spouse",
-    propertyId: "P26",
-    roleLabel: "spouse",
-    sourcePropertyDescription: "spouse",
-    parse: (text, parsed) => {
-      const parts = getSpouseClaimParts(text, parsed);
-      if (!parts) {
-        return null;
-      }
-
-      return {
-        entity: parts.person,
-        claimedValue: parts.claimedSpouse,
-      };
-    },
-    normalizeClaimedValue: normalizeEntityName,
-    normalizeExpectedValue: normalizeEntityName,
-  });
-}
-
-async function commonKnowledgeOrbitOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  return commonKnowledgeStructuredPropertyOverride(inputText, parsedClaim, {
-    id: "orbits",
-    propertyId: "P397",
-    roleLabel: "orbital center",
-    sourcePropertyDescription: "astronomical body orbits",
-    parse: (text, parsed) => {
-      const parts = getOrbitClaimParts(text, parsed);
-      if (!parts) {
-        return null;
-      }
-
-      return {
-        entity: parts.body,
-        claimedValue: parts.claimedCenter,
-      };
-    },
-    normalizeClaimedValue: normalizeEntityName,
-    normalizeExpectedValue: normalizeEntityName,
-  });
-}
-
-async function commonKnowledgeScienceIsAOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  const parts = getScienceIsAClaimParts(inputText, parsedClaim);
-  if (!parts) {
-    return null;
-  }
-
-  const mappedClass = SCIENCE_CLASS_MAP.find((item) => item.claimLabel === parts.claimedClass);
-  if (!mappedClass) {
-    return null;
-  }
-
-  try {
-    const entitySearch = await searchWikidataEntity(parts.entity);
-    if (!entitySearch) {
-      return null;
-    }
-
-    const entityPayload = await getWikidataEntities([entitySearch.id], "claims|labels");
-    const entityData = entityPayload?.entities?.[entitySearch.id];
-    if (!entityData?.claims) {
-      return null;
-    }
-
-    const instanceIds = extractItemIdsFromClaims(entityData.claims, "P31");
-    if (instanceIds.length === 0) {
-      return null;
-    }
-
-    const isMatch = instanceIds.includes(mappedClass.qid);
-    const relation: SourceReference["relation"] = isMatch ? "supports" : "contradicts";
-    const entityLabel = entityData.labels?.en?.value?.trim() || entitySearch.label || parts.entity;
-
-    const sources: SourceReference[] = [
-      {
-        id: `ck-wikidata-science-class-${entitySearch.id}`,
-        title: `${entityLabel} - Wikidata (instance of)`,
-        url: `https://www.wikidata.org/wiki/${entitySearch.id}`,
-        publisher: "Wikidata",
-        snippet: `${entityLabel} instance-of (P31) data ${isMatch ? "matches" : "does not match"} class '${mappedClass.claimLabel}'.`,
-        relation,
-        credibility: 95,
-        tier: "Tier 1",
-        domainAuthorityTier: "High",
-        domainAuthority: 88,
-        institutionalTrust: 90,
-        citationSignal: 84,
-        recencyScore: 88,
-        agreementScore: isMatch ? 95 : 96,
-        relevanceScore: 97,
-        finalScore: 95,
-        authorityScore: 92,
-      },
-    ];
-
-    return {
-      verdict: isMatch ? "True" : "False",
-      confidence: isMatch ? 95 : 93,
-      explanation: isMatch
-        ? `Common-knowledge science class fact matched: ${entityLabel} is a ${mappedClass.claimLabel}.`
-        : `Common-knowledge science class fact contradicts the claim: ${entityLabel} is not a ${mappedClass.claimLabel}.`,
-      sources,
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function commonKnowledgeAtomicNumberOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  const parts = getAtomicNumberClaimParts(inputText, parsedClaim);
-  if (!parts) {
-    return null;
-  }
-
-  try {
-    const entitySearch = await searchWikidataEntity(parts.entity);
-    if (!entitySearch) {
-      return null;
-    }
-
-    const entityPayload = await getWikidataEntities([entitySearch.id], "claims|labels");
-    const entityData = entityPayload?.entities?.[entitySearch.id];
-    if (!entityData?.claims) {
-      return null;
-    }
-
-    const knownAtomicNumbers = extractNumericClaimValues(entityData.claims, "P1086");
-    if (knownAtomicNumbers.length === 0) {
-      return null;
-    }
-
-    const isMatch = knownAtomicNumbers.includes(parts.claimedAtomicNumber);
-    const relation: SourceReference["relation"] = isMatch ? "supports" : "contradicts";
-    const entityLabel = entityData.labels?.en?.value?.trim() || entitySearch.label || parts.entity;
-    const canonicalAtomicNumber = knownAtomicNumbers[0];
-
-    const sources: SourceReference[] = [
-      {
-        id: `ck-wikidata-atomic-number-${entitySearch.id}`,
-        title: `${entityLabel} - Wikidata (atomic number)`,
-        url: `https://www.wikidata.org/wiki/${entitySearch.id}`,
-        publisher: "Wikidata",
-        snippet: `${entityLabel} lists atomic number ${canonicalAtomicNumber} via property P1086.`,
-        relation,
-        credibility: 96,
-        tier: "Tier 1",
-        domainAuthorityTier: "High",
-        domainAuthority: 88,
-        institutionalTrust: 90,
-        citationSignal: 86,
-        recencyScore: 90,
-        agreementScore: isMatch ? 96 : 97,
-        relevanceScore: 98,
-        finalScore: 96,
-        authorityScore: 92,
-      },
-    ];
-
-    return {
-      verdict: isMatch ? "True" : "False",
-      confidence: isMatch ? 97 : 95,
-      explanation: isMatch
-        ? `Common-knowledge atomic-number fact matched: ${entityLabel} has atomic number ${parts.claimedAtomicNumber}.`
-        : `Common-knowledge atomic-number fact contradicts the claim: ${entityLabel} has atomic number ${canonicalAtomicNumber}.`,
-      sources,
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function commonKnowledgeLifeStatusOverride(
-  inputText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<CommonKnowledgeResult | null> {
-  const parts = getLifeStatusClaimParts(inputText, parsedClaim);
-  if (!parts) {
-    return null;
-  }
-
-  try {
-    const entitySearch = await searchWikidataEntity(parts.person);
-    if (!entitySearch) {
-      return null;
-    }
-
-    const entityPayload = await getWikidataEntities([entitySearch.id], "claims|labels");
-    const entityData = entityPayload?.entities?.[entitySearch.id];
-    if (!entityData?.claims) {
-      return null;
-    }
-
-    const hasDeathDate = hasWikidataClaim(entityData.claims, "P570");
-    const inferredStatus: "dead" | "alive" = hasDeathDate ? "dead" : "alive";
-    const isMatch = inferredStatus === parts.claimedStatus;
-    const relation: SourceReference["relation"] = isMatch ? "supports" : "contradicts";
-    const personLabel = entityData.labels?.en?.value?.trim() || entitySearch.label || parts.person;
-
-    const statusSnippet = hasDeathDate
-      ? `${personLabel} has a recorded date of death in Wikidata (property P570), indicating the person is deceased.`
-      : `${personLabel} has no recorded date of death in Wikidata (property P570), which indicates the person is currently living in this dataset.`;
-
-    const sources: SourceReference[] = [
-      {
-        id: `ck-wikidata-life-status-${entitySearch.id}`,
-        title: `${personLabel} - Wikidata (life status)` ,
-        url: `https://www.wikidata.org/wiki/${entitySearch.id}`,
-        publisher: "Wikidata",
-        snippet: statusSnippet,
-        relation,
-        credibility: hasDeathDate ? 96 : 92,
-        tier: "Tier 1",
-        domainAuthorityTier: "High",
-        domainAuthority: 88,
-        institutionalTrust: 90,
-        citationSignal: 86,
-        recencyScore: hasDeathDate ? 94 : 84,
-        agreementScore: isMatch ? 96 : 97,
-        relevanceScore: 98,
-        finalScore: hasDeathDate ? 96 : 92,
-        authorityScore: 92,
-      },
-      {
-        id: `ck-wikipedia-life-status-${entitySearch.id}`,
-        title: `${personLabel} - Wikipedia`,
-        url: `https://en.wikipedia.org/wiki/${encodeURIComponent(personLabel)}`,
-        publisher: "Wikipedia",
-        snippet: hasDeathDate
-          ? `${personLabel} biographical references indicate the person is deceased.`
-          : `${personLabel} biographical references indicate the person is alive.`,
-        relation,
-        credibility: hasDeathDate ? 93 : 88,
-        tier: "Tier 1",
-        domainAuthorityTier: "High",
-        domainAuthority: 86,
-        institutionalTrust: 84,
-        citationSignal: 80,
-        recencyScore: hasDeathDate ? 90 : 82,
-        agreementScore: isMatch ? 94 : 95,
-        relevanceScore: 95,
-        finalScore: hasDeathDate ? 93 : 88,
-        authorityScore: 88,
-      },
-    ];
-
-    return {
-      verdict: isMatch ? "True" : "False",
-      confidence: hasDeathDate ? (isMatch ? 97 : 95) : (isMatch ? 90 : 93),
-      explanation: isMatch
-        ? `Common-knowledge life-status fact matched: ${personLabel} is ${inferredStatus}.`
-        : `Common-knowledge life-status fact contradicts the claim: ${personLabel} is ${inferredStatus}.`,
-      sources,
-    };
-  } catch {
-    return null;
-  }
-}
 
 function getEmbedding(text: string): number[] {
   const vector = Array.from({ length: EMBEDDING_DIMENSIONS }, () => 0);
@@ -1944,24 +356,6 @@ function computeSourceRelevance(
   };
 }
 
-function extractEntityCandidate(input: string) {
-  const parsed = parseClaimStructure(input);
-  if (parsed) {
-    return parsed.subject;
-  }
-
-  const titleCaseMatch = input.match(/([A-Z][a-z]+\s+[A-Z][a-z]+)/);
-  if (titleCaseMatch?.[1]) {
-    return titleCaseMatch[1];
-  }
-
-  return input
-    .split(/\s+/)
-    .slice(0, 4)
-    .join(" ")
-    .trim();
-}
-
 function isBlockedUrl(input: string) {
   try {
     const parsed = new URL(input);
@@ -2042,364 +436,6 @@ async function resolveInputText(input: string): Promise<{ inputText: string; ext
     externalFailures.push("URL fetch timed out or failed.");
     return { inputText: input, externalFailures };
   }
-}
-
-function extractDomain(url: string) {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return "";
-  }
-}
-
-function sourceTierLabel(tier: SourceTier): "Tier 1" | "Tier 2" | "Tier 3" {
-  if (tier === "government" || tier === "research") {
-    return "Tier 1";
-  }
-
-  if (tier === "news") {
-    return "Tier 2";
-  }
-
-  return "Tier 3";
-}
-
-function domainAuthorityTier(score: number): "High" | "Medium" | "Low" {
-  if (score >= 0.8) {
-    return "High";
-  }
-
-  if (score >= 0.62) {
-    return "Medium";
-  }
-
-  return "Low";
-}
-
-export function getDomainAuthority(url: string) {
-  const host = extractDomain(url);
-
-  if (!host) {
-    return 0.45;
-  }
-
-  if (
-    /ign\.com|techradar\.com|screenrant\.com|gamespot\.com|buzzfeed\.com|tmz\.com|variety\.com/.test(host)
-  ) {
-    return 0.2;
-  }
-
-  if (/\.gov(\.[a-z]{2})?$/.test(host) || /\.(edu)$/.test(host)) {
-    return 0.95;
-  }
-
-  if (/nasa\.gov|noaa\.gov|nih\.gov|cdc\.gov|nature\.com|science\.org|thelancet\.com|nejm\.org/.test(host)) {
-    return 0.96;
-  }
-
-  if (/worldbank\.org|who\.int|imf\.org|un\.org|wikidata\.org|wikipedia\.org/.test(host)) {
-    return 0.88;
-  }
-
-  if (/reuters\.com|apnews\.com|bbc\.com|nytimes\.com|wsj\.com|economist\.com/.test(host)) {
-    return 0.78;
-  }
-
-  if (/medium\.com|substack\.com|blogspot\.com|wordpress\.com|ghost\.io/.test(host)) {
-    return 0.55;
-  }
-
-  return 0.62;
-}
-
-function computeInstitutionalTrust(url: string, publisher: string) {
-  const host = extractDomain(url);
-  const text = `${host} ${publisher}`.toLowerCase();
-
-  if (/(world bank|who|imf|united nations|un sdg|cdc|nih)/i.test(text)) {
-    return 0.95;
-  }
-
-  if (/(journal|university|research|institute|peer)/i.test(text)) {
-    return 0.88;
-  }
-
-  if (/(news|times|post|reuters|ap|bbc)/i.test(text)) {
-    return 0.72;
-  }
-
-  if (/(blog|opinion|personal|influencer)/i.test(text)) {
-    return 0.36;
-  }
-
-  return 0.55;
-}
-
-function computeRecencyScoreFromText(text: string) {
-  const yearMatches = text.match(/\b(19\d{2}|20\d{2})\b/g) ?? [];
-  if (yearMatches.length === 0) {
-    return 58;
-  }
-
-  const newestYear = Math.max(...yearMatches.map((year) => Number(year)));
-  const currentYear = new Date().getUTCFullYear();
-  const age = Math.max(0, currentYear - newestYear);
-
-  return Math.max(28, Math.round(100 - age * 9));
-}
-
-function computeCitationSignal(text: string) {
-  const numberCount = (text.match(/\d+/g) ?? []).length;
-  const citationKeywords = (text.match(/\b(report|study|paper|dataset|survey|official|index|published)\b/gi) ?? [])
-    .length;
-
-  return clamp01(numberCount / 5 + citationKeywords / 4);
-}
-
-function computeTrustScore(url: string, publisher: string) {
-  const host = (() => {
-    try {
-      return new URL(url).hostname.toLowerCase();
-    } catch {
-      return "";
-    }
-  })();
-
-  const trustedHosts = [
-    "wikipedia.org",
-    "wikidata.org",
-    "reuters.com",
-    "apnews.com",
-    "bbc.com",
-    "nytimes.com",
-    "worldbank.org",
-    "who.int",
-    "imf.org",
-    "un.org",
-    "unstats.un.org",
-  ];
-
-  const tierFactor = sourceTierWeight(url, publisher);
-
-  if (trustedHosts.some((entry) => host.endsWith(entry))) {
-    return clamp01(0.9 * tierFactor);
-  }
-
-  if (publisher.toLowerCase().includes("news")) {
-    return clamp01(0.68 * tierFactor);
-  }
-
-  return clamp01(0.55 * tierFactor);
-}
-
-function buildTrustModel(url: string, publisher: string, text: string) {
-  const tier = classifySourceTier(url, publisher);
-  const domainAuthority = getDomainAuthority(url);
-  const institutionalTrust = computeInstitutionalTrust(url, publisher);
-  const recencyScore = computeRecencyScoreFromText(text);
-  const citationSignal = computeCitationSignal(text);
-  const agreementPenaltySafeTrust = computeTrustScore(url, publisher);
-
-  const blended = clamp01(
-    domainAuthority * 0.3 +
-      institutionalTrust * 0.25 +
-      (recencyScore / 100) * 0.15 +
-      citationSignal * 0.15 +
-      agreementPenaltySafeTrust * 0.15,
-  );
-
-  return {
-    tier,
-    tierLabel: sourceTierLabel(tier),
-    domainAuthorityTier: domainAuthorityTier(domainAuthority),
-    domainAuthority,
-    institutionalTrust,
-    recencyScore,
-    citationSignal,
-    trust: blended,
-  };
-}
-
-function classifySourceTier(url: string, publisher: string): SourceTier {
-  const host = (() => {
-    try {
-      return new URL(url).hostname.toLowerCase();
-    } catch {
-      return "";
-    }
-  })();
-  const publisherText = publisher.toLowerCase();
-
-  const governmentHosts = [
-    "worldbank.org",
-    "who.int",
-    "imf.org",
-    "un.org",
-    "unstats.un.org",
-    "data.gov",
-    "gov.uk",
-    "europa.eu",
-  ];
-
-  if (/\.gov(\.[a-z]{2})?$/.test(host) || governmentHosts.some((entry) => host.endsWith(entry))) {
-    return "government";
-  }
-
-  const researchHosts = [
-    "doi.org",
-    "arxiv.org",
-    "nature.com",
-    "science.org",
-    "nejm.org",
-    "thelancet.com",
-    "bmj.com",
-    "ncbi.nlm.nih.gov",
-  ];
-
-  if (
-    researchHosts.some((entry) => host.endsWith(entry)) ||
-    /(journal|university|institute|research|study|academ)/i.test(publisherText)
-  ) {
-    return "research";
-  }
-
-  if (
-    /(medium\.com|substack\.com|blogspot\.com|wordpress\.com|ghost\.io)$/.test(host) ||
-    /(blog|opinion|personal)/i.test(publisherText)
-  ) {
-    return "blog";
-  }
-
-  return "news";
-}
-
-function sourceTierWeight(url: string, publisher: string) {
-  return SOURCE_TIER_WEIGHT[classifySourceTier(url, publisher)];
-}
-
-function computeEvidenceQuality(title: string, snippet: string) {
-  const text = `${title} ${snippet}`.trim();
-  const lengthScore = clamp01(text.length / 220);
-  const hasNumbers = /\d/.test(text) ? 0.15 : 0;
-  const hasConcreteSignal = /(report|study|data|according|official|estimated|net worth|valuation)/i.test(text)
-    ? 0.2
-    : 0;
-  return clamp01(0.35 + lengthScore * 0.4 + hasNumbers + hasConcreteSignal);
-}
-
-function detectContradiction(claimText: string, evidenceText: string) {
-  const claim = ` ${claimText.toLowerCase()} `;
-  const evidence = ` ${evidenceText.toLowerCase()} `;
-
-  const oppositeConcepts: Array<[string[], string[]]> = [
-    [["dead", "deceased", "died"], ["alive", "living", "still alive", "continues to"]],
-    [["poor", "broke", "insolvent"], ["billionaire", "rich", "wealthy", "net worth"]],
-    [["increase", "up", "rose", "growth"], ["decrease", "down", "fell", "decline"]],
-    [["won", "victory"], ["lost", "defeat"]],
-    [["safe"], ["dangerous", "unsafe"]],
-  ];
-
-  for (const [left, right] of oppositeConcepts) {
-    const claimHasLeft = left.some((term) => claim.includes(` ${term} `));
-    const claimHasRight = right.some((term) => claim.includes(` ${term} `));
-    const evidenceHasLeft = left.some((term) => evidence.includes(` ${term} `));
-    const evidenceHasRight = right.some((term) => evidence.includes(` ${term} `));
-
-    if ((claimHasLeft && evidenceHasRight) || (claimHasRight && evidenceHasLeft)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-export function detectStance(claim: string, content: string): SourceStance {
-  const normalizedClaim = claim.toLowerCase();
-  const normalizedContent = content.toLowerCase();
-
-  // Handle common definitional claims where a snippet may state the correct entity
-  // without explicit negation words (for example, capital-city facts).
-  const claimParsed = parseClaimStructure(claim);
-  if (claimParsed && /\bcapital\b/i.test(normalizedClaim)) {
-    const subject = claimParsed.subject.toLowerCase();
-    const claimedObject = claimParsed.object.toLowerCase();
-    const mentionsSubject = normalizedContent.includes(subject);
-    const mentionsCapital = /\bcapital\b/.test(normalizedContent);
-    const isDefinitionalCapitalStatement =
-      /\b(is|was)\s+the\s+capital\s+of\b/.test(normalizedContent) ||
-      /\bcapital\s+of\s+[^.?!,;]{2,60}\s+\b(is|was)\b/.test(normalizedContent);
-    const mentionsClaimedObject = claimedObject
-      .split(/\s+/)
-      .filter(Boolean)
-      .some((token) => token.length > 2 && normalizedContent.includes(token));
-
-    if (mentionsSubject && mentionsCapital && isDefinitionalCapitalStatement && !mentionsClaimedObject) {
-      return "contradict";
-    }
-  }
-
-  if (detectContradiction(normalizedClaim, normalizedContent)) {
-    return "contradict";
-  }
-
-  const claimTokens = new Set(tokenize(normalizedClaim));
-  const contentTokens = new Set(tokenize(normalizedContent));
-  const overlap = [...claimTokens].filter((token) => contentTokens.has(token)).length;
-  const overlapRatio = claimTokens.size === 0 ? 0 : overlap / claimTokens.size;
-  const hasDirectNegation =
-    /\b(not|no|never|false|incorrect|debunked|untrue)\b/i.test(normalizedContent) && overlapRatio > 0.35;
-
-  const deadClaim = /\b(is|was|has been)?\s*(dead|deceased|died)\b/.test(normalizedClaim);
-  const aliveClaim = /\b(is|was|has been)?\s*(alive|living)\b/.test(normalizedClaim);
-  const evidenceSaysAlive = /\b(alive|living|still alive|is alive|remains alive)\b/.test(normalizedContent);
-  const evidenceSaysDead = /\b(dead|deceased|died|death announced|obituary)\b/.test(normalizedContent);
-
-  if ((deadClaim && evidenceSaysAlive) || (aliveClaim && evidenceSaysDead)) {
-    return "contradict";
-  }
-
-  if ((deadClaim && evidenceSaysDead) || (aliveClaim && evidenceSaysAlive)) {
-    return "support";
-  }
-
-  if (hasDirectNegation) {
-    return "contradict";
-  }
-
-  if (overlapRatio >= 0.35) {
-    return "support";
-  }
-
-  return "neutral";
-}
-
-function evaluateRelation(
-  claimText: string,
-  parsedClaim: ParsedClaim | null,
-  evidenceText: string,
-): "supports" | "contradicts" | "neutral" {
-  const stance = detectStance(parsedClaim ? `${parsedClaim.subject} ${parsedClaim.predicate} ${parsedClaim.object}` : claimText, evidenceText);
-  if (stance === "support") {
-    return "supports";
-  }
-
-  if (stance === "contradict") {
-    return "contradicts";
-  }
-
-  return "neutral";
-}
-
-function computeAgreementScore(relation: "supports" | "contradicts" | "neutral") {
-  if (relation === "supports") {
-    return 0.8;
-  }
-
-  if (relation === "contradicts") {
-    return 0.95;
-  }
-
-  return 0.4;
 }
 
 function deriveBiasProfile(inputText: string, sources: SourceReference[]): BiasProfile {
@@ -3083,7 +1119,13 @@ async function filterSourcesByRelevance(
 
   const candidateSources = prefilteredSources.length > 0 ? prefilteredSources : sources;
   const profile = CLAIM_RETRIEVAL_PROFILE[claimType];
-  const threshold = profile.relevanceThreshold;
+  const threshold = assessment.isBasicFact
+    ? Math.max(50, profile.relevanceThreshold - 20)
+    : profile.relevanceThreshold;
+  const semanticThreshold = assessment.isBasicFact
+    ? Math.max(MIN_RELAXED_SEMANTIC_THRESHOLD, profile.semanticThreshold - 0.15)
+    : profile.semanticThreshold;
+  const authorityThreshold = assessment.isBasicFact ? 0.3 : MIN_DOMAIN_AUTHORITY;
   const claimEmbedding = (await getEmbeddings([queryText]))[0];
   const sourceTexts = candidateSources.map((source) => `${source.title} ${source.snippet} ${source.publisher}`);
   const sourceEmbeddings = await getEmbeddings(sourceTexts);
@@ -3129,15 +1171,15 @@ async function filterSourcesByRelevance(
 
   // Strict pass first. If it is too sparse, progressively relax gates to avoid empty evidence sets.
   const strictFiltered = withScores
-    .filter((source) => source.semanticSimilarity >= profile.semanticThreshold)
-    .filter((source) => source.hardMatch)
-    .filter((source) => ((source.authorityScore ?? 0) / 100) >= MIN_DOMAIN_AUTHORITY)
+    .filter((source) => source.semanticSimilarity >= semanticThreshold)
+    .filter((source) => source.hardMatch || (assessment.isBasicFact && source.stance !== "neutral"))
+    .filter((source) => ((source.authorityScore ?? 0) / 100) >= authorityThreshold)
     .filter((source) => (source.relevanceScore ?? 0) >= threshold)
     .sort((a, b) => (b.finalScore ?? 0) - (a.finalScore ?? 0));
 
   const relaxedSemanticThreshold = Math.max(
     MIN_RELAXED_SEMANTIC_THRESHOLD,
-    profile.semanticThreshold - 0.15,
+    semanticThreshold - 0.15,
   );
   const relaxedRelevanceThreshold = Math.max(
     MIN_RELAXED_RELEVANCE_THRESHOLD,
@@ -3415,7 +1457,7 @@ function calibrateConfidence(params: {
     decisiveEvidence,
   } = params;
 
-  const dominance = Math.max(supportRatio, contradictionRatio);
+  const dominance = Math.abs(supportRatio - contradictionRatio);
   const coverage = clamp01(sourceCount / 4);
   const evidenceStrength = clamp01(avgAuthority * 0.55 + avgRelevance * 0.45);
   const blended = Math.round(
@@ -3436,7 +1478,7 @@ function calibrateConfidence(params: {
     return Math.max(90, Math.min(97, blended + 6));
   }
 
-  const sparsePenalty = sourceCount < 2 ? 8 : 0;
+  const sparsePenalty = sourceCount < 2 && avgAuthority < 0.7 ? 8 : 0;
   return Math.max(40, Math.min(97, blended - sparsePenalty + consensusLift));
 }
 
@@ -3558,6 +1600,17 @@ function scoreEvidence(
 
   let normalizedVerdict: VerificationVerdict = "UNKNOWN";
 
+  const strongSource = sources.find(
+    (source) =>
+      (source.authorityScore ?? 0) >= 85 &&
+      (source.relevanceScore ?? 0) >= 70 &&
+      source.relation !== "neutral",
+  );
+
+  if (strongSource && sources.length <= 2) {
+    normalizedVerdict = strongSource.relation === "supports" ? "TRUE" : "FALSE";
+  }
+
   const statusClaim = assessment.statusClaim;
   const supportAuthorityStrong =
     supportCount === 0
@@ -3580,7 +1633,7 @@ function scoreEvidence(
     return true;
   }).length;
 
-  if (statusClaim === "dead" || statusClaim === "alive") {
+  if (normalizedVerdict === "UNKNOWN" && (statusClaim === "dead" || statusClaim === "alive")) {
     if (
       supportRatio >= 0.78 &&
       supportCount >= 3 &&
@@ -3613,7 +1666,21 @@ function scoreEvidence(
     normalizedVerdict = "FALSE";
   }
 
-  if (normalizedVerdict === "UNKNOWN" && supportCount >= 2 && supportRatio >= 0.67) {
+  if (
+    normalizedVerdict === "UNKNOWN" &&
+    assessment.isBasicFact &&
+    supportCount >= 1 &&
+    supportRatio >= 0.6
+  ) {
+    normalizedVerdict = "TRUE";
+  } else if (
+    normalizedVerdict === "UNKNOWN" &&
+    assessment.isBasicFact &&
+    contradictionCount >= 1 &&
+    contradictionRatio >= 0.6
+  ) {
+    normalizedVerdict = "FALSE";
+  } else if (normalizedVerdict === "UNKNOWN" && supportCount >= 2 && supportRatio >= 0.67) {
     normalizedVerdict = "TRUE";
   } else if (normalizedVerdict === "UNKNOWN" && contradictionCount >= 2 && contradictionRatio >= 0.67) {
     normalizedVerdict = "FALSE";
@@ -3684,10 +1751,14 @@ function scoreEvidence(
     isBasicFact: assessment.isBasicFact,
     decisiveEvidence,
   });
+  const finalConfidence =
+    assessment.isBasicFact && normalizedVerdict !== "UNKNOWN"
+      ? Math.max(85, adjustedConfidence)
+      : adjustedConfidence;
 
   return {
     verdict: verificationVerdictToVerdict(normalizedVerdict),
-    confidence: adjustedConfidence,
+    confidence: finalConfidence,
     supportWeight,
     contradictionWeight,
     explanation,
@@ -3865,312 +1936,35 @@ export function parseInputPayload(payload: { claim?: unknown; input?: unknown; u
   return parseInput(payload);
 }
 
-async function runAnalysisPipeline(input: string, parsedClaim: ParsedClaim | null) {
-  const resolved = await resolveInputText(input);
-  const resolvedParsedClaim = parseClaimStructure(resolved.inputText) ?? parsedClaim;
-
-  const commonKnowledge = commonKnowledgeCapitalOverride(resolved.inputText, resolvedParsedClaim);
-  if (commonKnowledge) {
-    const supportWeight = commonKnowledge.sources
-      .filter((source) => source.relation === "supports")
-      .reduce((total, source) => total + (source.finalScore ?? source.credibility), 0);
-    const contradictionWeight = commonKnowledge.sources
-      .filter((source) => source.relation === "contradicts")
-      .reduce((total, source) => total + (source.finalScore ?? source.credibility), 0);
-    const biasProfile = deriveBiasProfile(resolved.inputText, commonKnowledge.sources);
-
-    return {
-      resolvedInputText: resolved.inputText,
-      resolvedParsedClaim,
-      assessment: {
-        isBasicFact: true,
-        category: "geography" as const,
-        decisivePrompt:
-          "Common-knowledge fast check applied for a stable geography fact.",
-        isHighCertaintyFact: true,
-        statusClaim: null,
-      },
-      scoring: {
-        verdict: commonKnowledge.verdict,
-        confidence: commonKnowledge.confidence,
-        explanation: commonKnowledge.explanation,
-        supportWeight,
-        contradictionWeight,
-        dimensions: {
-          factualAccuracy: 97,
-          sourceAgreement: 96,
-          recencyScore: 90,
-          biasRisk: biasProfile.manipulationRisk,
-        },
-        biasProfile,
-        misleadingSegments: detectMisleadingSegments(resolved.inputText),
-        subClaims: buildSubClaims(resolved.inputText, resolvedParsedClaim, commonKnowledge.sources),
-      },
-      sources: commonKnowledge.sources,
-      externalFailures: [
-        ...resolved.externalFailures,
-        "High-certainty common-knowledge override used for a stable capital-city claim.",
-      ],
-      droppedCount: 0,
-      preFilteredCount: 0,
-      threshold: CLAIM_RETRIEVAL_PROFILE[classifyClaimType(resolved.inputText, resolvedParsedClaim)].relevanceThreshold,
-    };
-  }
-
-  const commonKnowledgeCeo = await commonKnowledgeCeoOverride(resolved.inputText, resolvedParsedClaim);
-  if (commonKnowledgeCeo) {
-    const supportWeight = commonKnowledgeCeo.sources
-      .filter((source) => source.relation === "supports")
-      .reduce((total, source) => total + (source.finalScore ?? source.credibility), 0);
-    const contradictionWeight = commonKnowledgeCeo.sources
-      .filter((source) => source.relation === "contradicts")
-      .reduce((total, source) => total + (source.finalScore ?? source.credibility), 0);
-    const biasProfile = deriveBiasProfile(resolved.inputText, commonKnowledgeCeo.sources);
-
-    return {
-      resolvedInputText: resolved.inputText,
-      resolvedParsedClaim,
-      assessment: {
-        isBasicFact: true,
-        category: "historical" as const,
-        decisivePrompt:
-          "Common-knowledge fast check applied for stable role/title fact.",
-        isHighCertaintyFact: true,
-        statusClaim: null,
-      },
-      scoring: {
-        verdict: commonKnowledgeCeo.verdict,
-        confidence: commonKnowledgeCeo.confidence,
-        explanation: commonKnowledgeCeo.explanation,
-        supportWeight,
-        contradictionWeight,
-        dimensions: {
-          factualAccuracy: 95,
-          sourceAgreement: 92,
-          recencyScore: 86,
-          biasRisk: biasProfile.manipulationRisk,
-        },
-        biasProfile,
-        misleadingSegments: detectMisleadingSegments(resolved.inputText),
-        subClaims: buildSubClaims(resolved.inputText, resolvedParsedClaim, commonKnowledgeCeo.sources),
-      },
-      sources: commonKnowledgeCeo.sources,
-      externalFailures: [
-        ...resolved.externalFailures,
-        "High-certainty common-knowledge override used for CEO role claim.",
-      ],
-      droppedCount: 0,
-      preFilteredCount: 0,
-      threshold: CLAIM_RETRIEVAL_PROFILE[classifyClaimType(resolved.inputText, resolvedParsedClaim)].relevanceThreshold,
-    };
-  }
-
-  const commonKnowledgeLifeStatus = await commonKnowledgeLifeStatusOverride(
-    resolved.inputText,
-    resolvedParsedClaim,
-  );
-  if (commonKnowledgeLifeStatus) {
-    const supportWeight = commonKnowledgeLifeStatus.sources
-      .filter((source) => source.relation === "supports")
-      .reduce((total, source) => total + (source.finalScore ?? source.credibility), 0);
-    const contradictionWeight = commonKnowledgeLifeStatus.sources
-      .filter((source) => source.relation === "contradicts")
-      .reduce((total, source) => total + (source.finalScore ?? source.credibility), 0);
-    const biasProfile = deriveBiasProfile(resolved.inputText, commonKnowledgeLifeStatus.sources);
-
-    return {
-      resolvedInputText: resolved.inputText,
-      resolvedParsedClaim,
-      assessment: {
-        isBasicFact: true,
-        category: "historical" as const,
-        decisivePrompt:
-          "Common-knowledge fast check applied for life-status fact.",
-        isHighCertaintyFact: true,
-        statusClaim: /\b(dead|deceased|died)\b/i.test(resolved.inputText) ? "dead" : "alive",
-      },
-      scoring: {
-        verdict: commonKnowledgeLifeStatus.verdict,
-        confidence: commonKnowledgeLifeStatus.confidence,
-        explanation: commonKnowledgeLifeStatus.explanation,
-        supportWeight,
-        contradictionWeight,
-        dimensions: {
-          factualAccuracy: 95,
-          sourceAgreement: 93,
-          recencyScore: 86,
-          biasRisk: biasProfile.manipulationRisk,
-        },
-        biasProfile,
-        misleadingSegments: detectMisleadingSegments(resolved.inputText),
-        subClaims: buildSubClaims(resolved.inputText, resolvedParsedClaim, commonKnowledgeLifeStatus.sources),
-      },
-      sources: commonKnowledgeLifeStatus.sources,
-      externalFailures: [
-        ...resolved.externalFailures,
-        "High-certainty common-knowledge override used for life-status claim.",
-      ],
-      droppedCount: 0,
-      preFilteredCount: 0,
-      threshold: CLAIM_RETRIEVAL_PROFILE[classifyClaimType(resolved.inputText, resolvedParsedClaim)].relevanceThreshold,
-    };
-  }
-
-  const claimType = classifyClaimType(resolved.inputText, resolvedParsedClaim);
-  const assessment = assessClaimForDecisiveMode(
-    resolved.inputText,
-    resolvedParsedClaim,
-    claimType,
-  );
-
-  if (assessment.needsVerification) {
-    const biasProfile = deriveBiasProfile(resolved.inputText, []);
-    return {
-      resolvedInputText: resolved.inputText,
-      resolvedParsedClaim,
-      assessment,
-      scoring: {
-        verdict: "Unknown" as const,
-        confidence: 38,
-        explanation: `Needs Verification: ${assessment.verificationReason ?? "This claim is not suitable for deterministic fact-check verdicts."}`,
-        supportWeight: 0,
-        contradictionWeight: 0,
-        dimensions: {
-          factualAccuracy: 42,
-          sourceAgreement: 30,
-          recencyScore: 45,
-          biasRisk: biasProfile.manipulationRisk,
-        },
-        biasProfile,
-        misleadingSegments: detectMisleadingSegments(resolved.inputText),
-        subClaims: buildSubClaims(resolved.inputText, resolvedParsedClaim, []),
-      },
-      sources: [],
-      externalFailures: [
-        ...resolved.externalFailures,
-        "Needs verification mode activated for subjective/speculative claim.",
-      ],
-      droppedCount: 0,
-      preFilteredCount: 0,
-      threshold: CLAIM_RETRIEVAL_PROFILE[claimType].relevanceThreshold,
-    };
-  }
-
-  const structuredOverrides = await Promise.all([
-    commonKnowledgeOrbitOverride(resolved.inputText, resolvedParsedClaim),
-    commonKnowledgeScienceIsAOverride(resolved.inputText, resolvedParsedClaim),
-    commonKnowledgeAtomicNumberOverride(resolved.inputText, resolvedParsedClaim),
-    commonKnowledgeBornInOverride(resolved.inputText, resolvedParsedClaim),
-    commonKnowledgeDiedInOverride(resolved.inputText, resolvedParsedClaim),
-    commonKnowledgeSpouseOverride(resolved.inputText, resolvedParsedClaim),
-    commonKnowledgeFounderOverride(resolved.inputText, resolvedParsedClaim),
-    commonKnowledgePresidentOverride(resolved.inputText, resolvedParsedClaim),
-    commonKnowledgePrimeMinisterOverride(resolved.inputText, resolvedParsedClaim),
-    commonKnowledgeHeadquartersOverride(resolved.inputText, resolvedParsedClaim),
-  ]);
-  const firstStructuredOverride = structuredOverrides.find((item) => Boolean(item)) ?? null;
-
-  if (firstStructuredOverride) {
-    const supportWeight = firstStructuredOverride.sources
-      .filter((source) => source.relation === "supports")
-      .reduce((total, source) => total + (source.finalScore ?? source.credibility), 0);
-    const contradictionWeight = firstStructuredOverride.sources
-      .filter((source) => source.relation === "contradicts")
-      .reduce((total, source) => total + (source.finalScore ?? source.credibility), 0);
-    const biasProfile = deriveBiasProfile(resolved.inputText, firstStructuredOverride.sources);
-
-    return {
-      resolvedInputText: resolved.inputText,
-      resolvedParsedClaim,
-      assessment: {
-        isBasicFact: true,
-        category: "historical" as const,
-        decisivePrompt:
-          "Common-knowledge fast check applied for stable role/location fact.",
-        isHighCertaintyFact: true,
-        statusClaim: null,
-      },
-      scoring: {
-        verdict: firstStructuredOverride.verdict,
-        confidence: firstStructuredOverride.confidence,
-        explanation: firstStructuredOverride.explanation,
-        supportWeight,
-        contradictionWeight,
-        dimensions: {
-          factualAccuracy: 95,
-          sourceAgreement: 92,
-          recencyScore: 86,
-          biasRisk: biasProfile.manipulationRisk,
-        },
-        biasProfile,
-        misleadingSegments: detectMisleadingSegments(resolved.inputText),
-        subClaims: buildSubClaims(resolved.inputText, resolvedParsedClaim, firstStructuredOverride.sources),
-      },
-      sources: firstStructuredOverride.sources,
-      externalFailures: [
-        ...resolved.externalFailures,
-        "High-certainty common-knowledge override used for role/location claim.",
-      ],
-      droppedCount: 0,
-      preFilteredCount: 0,
-      threshold: CLAIM_RETRIEVAL_PROFILE[classifyClaimType(resolved.inputText, resolvedParsedClaim)].relevanceThreshold,
-    };
-  }
-
-  const primaryRetrieval = await retrieveSourcesWithRetries(
-    resolved.inputText,
-    resolvedParsedClaim,
-    claimType,
-    assessment,
-  );
-  const subClaimRetrieval = await retrieveSubClaimSources(
-    resolved.inputText,
-    resolvedParsedClaim,
-  );
-
-  const sources = dedupeSources([
-    ...primaryRetrieval.sources,
-    ...subClaimRetrieval.sources,
-  ]);
-  const scoring = scoreEvidence(sources, resolved.inputText, resolvedParsedClaim, assessment);
-
-  const externalFailures = [
-    ...resolved.externalFailures,
-    ...primaryRetrieval.externalFailures,
-    ...subClaimRetrieval.failures,
-  ];
-
-  if (primaryRetrieval.droppedCount > 0) {
-    externalFailures.push(
-      `Filtered ${primaryRetrieval.droppedCount} low-relevance sources below threshold ${primaryRetrieval.threshold}.`,
-    );
-  }
-  if (primaryRetrieval.preFilteredCount > 0) {
-    externalFailures.push(
-      `Dropped ${primaryRetrieval.preFilteredCount} irrelevant sources before semantic evaluation.`,
-    );
-  }
-  if (assessment.isBasicFact) {
-    externalFailures.push(`Decisive fact-check directive enabled. ${assessment.decisivePrompt}`);
-  }
-  if (sources.length === 0) {
-    externalFailures.push(
-      "All retrieval retries returned no usable sources. Debug: retrieval-empty-after-retry.",
-    );
-  }
-
-  return {
-    resolvedInputText: resolved.inputText,
-    resolvedParsedClaim,
-    assessment,
-    scoring,
-    sources,
-    externalFailures,
-    droppedCount: primaryRetrieval.droppedCount,
-    preFilteredCount: primaryRetrieval.preFilteredCount,
-    threshold: primaryRetrieval.threshold,
-  };
-}
+const runAnalysisPipeline = createRunAnalysisPipeline({
+  resolveInputText,
+  parseClaimStructure,
+  classifyClaimType,
+  assessClaimForDecisiveMode,
+  retrieveSourcesWithRetries,
+  retrieveSubClaimSources,
+  dedupeSources,
+  scoreEvidence,
+  deriveBiasProfile,
+  detectMisleadingSegments,
+  buildSubClaims,
+  getRetrievalThreshold: (claimType) => CLAIM_RETRIEVAL_PROFILE[claimType].relevanceThreshold,
+  commonKnowledgeCapitalOverride,
+  commonKnowledgeUltraBasicOverride,
+  commonKnowledgeCeoOverride,
+  commonKnowledgeBoilingPointOverride,
+  commonKnowledgeLifeStatusOverride,
+  commonKnowledgeOrbitOverride,
+  commonKnowledgeScienceIsAOverride,
+  commonKnowledgeAtomicNumberOverride,
+  commonKnowledgeBornInOverride,
+  commonKnowledgeDiedInOverride,
+  commonKnowledgeSpouseOverride,
+  commonKnowledgeFounderOverride,
+  commonKnowledgePresidentOverride,
+  commonKnowledgePrimeMinisterOverride,
+  commonKnowledgeHeadquartersOverride,
+});
 
 export async function createAnalysis(input: string, userId?: string) {
   const { queries, results } = await getCollections();
@@ -4180,7 +1974,7 @@ export async function createAnalysis(input: string, userId?: string) {
   const normalizedInput = normalizeInput(input);
   const parsedClaim = parseClaimStructure(inputType === "text" ? input : "");
   const parsedClaimValue = parsedClaim ?? undefined;
-  const dedupeKey = buildDedupeKey(normalizedInput);
+  const dedupeKey = buildDedupeKey(normalizedInput, ANALYSIS_MODEL_VERSION);
   const now = new Date();
   const existing = await results.findOne({ dedupeKey }, { sort: { createdAt: -1 } });
   if (existing?._id) {
@@ -4385,7 +2179,7 @@ export async function updateAnalysis(resultId: string, input: string, userId?: s
         rawInput: input,
         inputType,
         normalizedInput: normalizeInput(input),
-        dedupeKey: buildDedupeKey(normalizeInput(input)),
+        dedupeKey: buildDedupeKey(normalizeInput(input), ANALYSIS_MODEL_VERSION),
         parsedClaim: parsedClaimValue,
         sourcesUsed: sources.map((source) => source.publisher),
       },
@@ -4483,6 +2277,8 @@ export async function compareClaimPerspectives(input: string, userId?: string): 
 export const __testHooks = {
   buildFallbackSearchQueries,
   commonKnowledgeCapitalOverride,
+  commonKnowledgeUltraBasicOverride,
+  commonKnowledgeBoilingPointOverride,
   commonKnowledgeCeoOverride,
   commonKnowledgeLifeStatusOverride,
   commonKnowledgeOrbitOverride,

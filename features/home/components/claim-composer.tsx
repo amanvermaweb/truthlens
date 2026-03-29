@@ -1,14 +1,10 @@
 "use client";
 
+import { CreateClaimResponse } from "@/lib/contracts";
 import { useRouter } from "next/navigation";
 import { type SubmitEvent, useState } from "react";
 
 const MIN_CLAIM_LENGTH = 8;
-
-type CreateClaimResponse = {
-  claimId?: string;
-  error?: string;
-};
 
 type ClaimComposerProps = {
   className?: string;

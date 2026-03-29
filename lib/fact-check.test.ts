@@ -18,6 +18,8 @@ let commonKnowledgeLifeStatusOverride: (typeof import("./fact-check"))["__testHo
 let commonKnowledgeOrbitOverride: (typeof import("./fact-check"))["__testHooks"]["commonKnowledgeOrbitOverride"];
 let commonKnowledgeScienceIsAOverride: (typeof import("./fact-check"))["__testHooks"]["commonKnowledgeScienceIsAOverride"];
 let commonKnowledgeAtomicNumberOverride: (typeof import("./fact-check"))["__testHooks"]["commonKnowledgeAtomicNumberOverride"];
+let commonKnowledgeBoilingPointOverride: (typeof import("./fact-check"))["__testHooks"]["commonKnowledgeBoilingPointOverride"];
+let commonKnowledgeUltraBasicOverride: (typeof import("./fact-check"))["__testHooks"]["commonKnowledgeUltraBasicOverride"];
 
 beforeAll(async () => {
   const factCheckModule = await import("./fact-check");
@@ -33,6 +35,8 @@ beforeAll(async () => {
   commonKnowledgeOrbitOverride = factCheckModule.__testHooks.commonKnowledgeOrbitOverride;
   commonKnowledgeScienceIsAOverride = factCheckModule.__testHooks.commonKnowledgeScienceIsAOverride;
   commonKnowledgeAtomicNumberOverride = factCheckModule.__testHooks.commonKnowledgeAtomicNumberOverride;
+  commonKnowledgeBoilingPointOverride = factCheckModule.__testHooks.commonKnowledgeBoilingPointOverride;
+  commonKnowledgeUltraBasicOverride = factCheckModule.__testHooks.commonKnowledgeUltraBasicOverride;
 });
 
 function source(partial: Partial<SourceReference>): SourceReference {
@@ -738,6 +742,36 @@ describe("fact-check scoring regressions", () => {
     fetchMock.mockRestore();
   });
 
+  it("resolves water boiling point at sea level", () => {
+    const result = commonKnowledgeBoilingPointOverride(
+      "Water boils at 100°C at sea level",
+      { subject: "Water", predicate: "boils", object: "at 100°C at sea level" },
+    );
+
+    expect(result?.verdict).toBe("True");
+    expect(result?.confidence).toBeGreaterThanOrEqual(95);
+    expect(result?.sources.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("contradicts incorrect water boiling point at sea level", () => {
+    const result = commonKnowledgeBoilingPointOverride(
+      "Water boils at 95 C at sea level",
+      { subject: "Water", predicate: "boils", object: "at 95 C at sea level" },
+    );
+
+    expect(result?.verdict).toBe("False");
+    expect(result?.confidence).toBeGreaterThanOrEqual(90);
+  });
+
+  it("does not apply water boiling point override without pressure context", () => {
+    const result = commonKnowledgeBoilingPointOverride(
+      "Water boils at 100 C",
+      { subject: "Water", predicate: "boils", object: "at 100 C" },
+    );
+
+    expect(result).toBeNull();
+  });
+
   it("does not mark death-hoax claims true when authoritative sources contradict", () => {
     const result = scoreEvidence(
       [
@@ -975,5 +1009,46 @@ describe("fact-check scoring regressions", () => {
 
     expect(result.verdict).toBe("Unknown");
     expect(result.explanation.startsWith("Needs Verification:")).toBe(true);
+  });
+
+  it("allows a single strong source to resolve basic fact claims", () => {
+    const result = scoreEvidence(
+      [
+        source({
+          id: "nasa-earth-orbit",
+          publisher: "NASA",
+          url: "https://solarsystem.nasa.gov/planets/earth/overview/",
+          title: "Earth Overview",
+          snippet: "Earth orbits the Sun.",
+          relation: "supports",
+          relevanceScore: 92,
+          authorityScore: 94,
+          finalScore: 93,
+          credibility: 93,
+        }),
+      ],
+      "Earth revolves around Sun",
+      { subject: "Earth", predicate: "revolves", object: "around Sun" },
+      {
+        isBasicFact: true,
+        category: "science",
+        decisivePrompt: "Decisive mode",
+        isHighCertaintyFact: true,
+        statusClaim: null,
+      },
+    );
+
+    expect(result.verdict).toBe("True");
+    expect(result.confidence).toBeGreaterThanOrEqual(85);
+  });
+
+  it("matches ultra-basic fact overrides for canonical science claims", () => {
+    const positive = commonKnowledgeUltraBasicOverride("Earth revolves around Sun");
+    const negative = commonKnowledgeUltraBasicOverride("Sun is a planet");
+
+    expect(positive?.verdict).toBe("True");
+    expect(positive?.confidence).toBeGreaterThanOrEqual(95);
+    expect(negative?.verdict).toBe("False");
+    expect(negative?.confidence).toBeGreaterThanOrEqual(90);
   });
 });
