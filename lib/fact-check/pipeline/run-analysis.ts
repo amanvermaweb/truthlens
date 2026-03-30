@@ -61,7 +61,10 @@ type PipelineDeps = {
     sources: SourceReference[],
   ) => PipelineScoring["subClaims"];
   getRetrievalThreshold: (claimType: ClaimType) => number;
-  commonKnowledgeCapitalOverride: (inputText: string, parsedClaim: ParsedClaim | null) => CommonKnowledgeResult | null;
+  commonKnowledgeCapitalOverride: (
+    inputText: string,
+    parsedClaim: ParsedClaim | null,
+  ) => Promise<CommonKnowledgeResult | null>;
   commonKnowledgeUltraBasicOverride: (inputText: string) => CommonKnowledgeResult | null;
   commonKnowledgeCeoOverride: (inputText: string, parsedClaim: ParsedClaim | null) => Promise<CommonKnowledgeResult | null>;
   commonKnowledgeBoilingPointOverride: (inputText: string, parsedClaim: ParsedClaim | null) => CommonKnowledgeResult | null;
@@ -76,6 +79,7 @@ type PipelineDeps = {
   commonKnowledgePresidentOverride: (inputText: string, parsedClaim: ParsedClaim | null) => Promise<CommonKnowledgeResult | null>;
   commonKnowledgePrimeMinisterOverride: (inputText: string, parsedClaim: ParsedClaim | null) => Promise<CommonKnowledgeResult | null>;
   commonKnowledgeHeadquartersOverride: (inputText: string, parsedClaim: ParsedClaim | null) => Promise<CommonKnowledgeResult | null>;
+  commonKnowledgeAiFallbackOverride: (inputText: string, parsedClaim: ParsedClaim | null) => Promise<CommonKnowledgeResult | null>;
 };
 
 function getEvidenceWeights(sources: SourceReference[]) {
@@ -167,7 +171,7 @@ export function createRunAnalysisPipeline(deps: PipelineDeps) {
     const resolvedClaimType = deps.classifyClaimType(resolved.inputText, resolvedParsedClaim);
     const threshold = deps.getRetrievalThreshold(resolvedClaimType);
 
-    const commonKnowledge = deps.commonKnowledgeCapitalOverride(resolved.inputText, resolvedParsedClaim);
+    const commonKnowledge = await deps.commonKnowledgeCapitalOverride(resolved.inputText, resolvedParsedClaim);
     if (commonKnowledge) {
       return buildOverrideResult({
         resolvedInputText: resolved.inputText,
@@ -334,6 +338,28 @@ export function createRunAnalysisPipeline(deps: PipelineDeps) {
         externalFailures: resolved.externalFailures,
         externalFailureMessage:
           "High-certainty common-knowledge override used for role/location claim.",
+        threshold,
+        deps,
+      });
+    }
+
+    const commonKnowledgeAiFallback = await deps.commonKnowledgeAiFallbackOverride(
+      resolved.inputText,
+      resolvedParsedClaim,
+    );
+    if (commonKnowledgeAiFallback) {
+      return buildOverrideResult({
+        resolvedInputText: resolved.inputText,
+        resolvedParsedClaim,
+        commonKnowledge: commonKnowledgeAiFallback,
+        category: "general",
+        decisivePrompt: "AI-assisted common-knowledge fallback applied with citation validation.",
+        factualAccuracy: 88,
+        sourceAgreement: 84,
+        recencyScore: 82,
+        externalFailures: resolved.externalFailures,
+        externalFailureMessage:
+          "Citation-validated AI fallback used for common-knowledge claim without deterministic match.",
         threshold,
         deps,
       });

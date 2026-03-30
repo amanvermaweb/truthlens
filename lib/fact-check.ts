@@ -1,5 +1,6 @@
 import { connectToDatabase } from "@/lib/mongodb";
 import {
+  commonKnowledgeAiFallbackOverride,
   commonKnowledgeAtomicNumberOverride,
   commonKnowledgeBoilingPointOverride,
   commonKnowledgeBornInOverride,
@@ -37,6 +38,15 @@ import {
   rewriteClaimQueries,
   tokenize,
 } from "@/lib/fact-check/claim-utils";
+import {
+  getEmbedding,
+  getEmbeddings,
+} from "@/lib/fact-check/embedding-utils";
+import {
+  computeSourceRelevance,
+  passHardRelevanceFilter,
+} from "@/lib/fact-check/relevance-utils";
+import { fetchInstitutionalApiSources } from "@/lib/fact-check/institutional-sources";
 import {
   computeEvidenceQuality,
   buildTrustModel,
@@ -82,7 +92,6 @@ const CLAIM_RETRIEVAL_PROFILE: Record<ClaimType, RetrievalProfile> = {
   statistical: { relevanceThreshold: 74, semanticThreshold: 0.75, includeInstitutional: true, newsPageSize: 4 },
 };
 
-const EMBEDDING_DIMENSIONS = 256;
 const MIN_DOMAIN_AUTHORITY = 0.4;
 const MIN_RELAXED_SEMANTIC_THRESHOLD = 0.5;
 const MIN_RELAXED_RELEVANCE_THRESHOLD = 46;
@@ -185,176 +194,6 @@ export type LegacyClaimResponse = {
   createdAt: Date;
   updatedAt?: Date;
 };
-
-function getEmbedding(text: string): number[] {
-  const vector = Array.from({ length: EMBEDDING_DIMENSIONS }, () => 0);
-  const tokens = tokenize(text);
-
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index];
-    const hash = hashValue(`${token}:${index}`);
-    const slot = Number.parseInt(hash.slice(0, 8), 16) % EMBEDDING_DIMENSIONS;
-    const sign = Number.parseInt(hash.slice(8, 10), 16) % 2 === 0 ? 1 : -1;
-    vector[slot] += sign;
-  }
-
-  return normalizeVector(vector);
-}
-
-async function fetchOpenAIEmbeddings(texts: string[]): Promise<number[][] | null> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey || texts.length === 0) {
-    return null;
-  }
-
-  try {
-    const response = await fetchWithTimeout("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: process.env.OPENAI_EMBEDDING_MODEL ?? "text-embedding-3-small",
-        input: texts,
-      }),
-    });
-
-    if (!response.ok) {
-      return null;
-    }
-
-    const payload = (await response.json()) as {
-      data?: Array<{ embedding?: number[] }>;
-    };
-
-    const embeddings = payload.data?.map((item) => item.embedding ?? []);
-    if (!embeddings || embeddings.length !== texts.length) {
-      return null;
-    }
-
-    return embeddings.map(normalizeVector);
-  } catch {
-    return null;
-  }
-}
-
-function normalizeVector(vector: number[]) {
-  const norm = Math.sqrt(vector.reduce((acc, value) => acc + value * value, 0));
-  if (norm === 0) {
-    return vector;
-  }
-
-  return vector.map((value) => value / norm);
-}
-
-async function getEmbeddings(texts: string[]) {
-  const openAIEmbeddings = await fetchOpenAIEmbeddings(texts);
-  if (openAIEmbeddings) {
-    return openAIEmbeddings;
-  }
-
-  return texts.map(getEmbedding);
-}
-
-function cosineSimilarity(a: number[], b: number[]) {
-  if (a.length === 0 || b.length === 0 || a.length !== b.length) {
-    return 0;
-  }
-
-  let dot = 0;
-  let aNorm = 0;
-  let bNorm = 0;
-
-  for (let index = 0; index < a.length; index += 1) {
-    dot += a[index] * b[index];
-    aNorm += a[index] * a[index];
-    bNorm += b[index] * b[index];
-  }
-
-  const denom = Math.sqrt(aNorm) * Math.sqrt(bNorm);
-  return denom === 0 ? 0 : dot / denom;
-}
-
-function extractClaimSignals(claimText: string, parsedClaim: ParsedClaim | null) {
-  const rawTokens = tokenize(claimText);
-  const subjectTokens = tokenize(parsedClaim?.subject ?? rawTokens.slice(0, 3).join(" "));
-  const objectTokens = tokenize(parsedClaim?.object ?? rawTokens.slice(-3).join(" "));
-  const relationTokens = tokenize(parsedClaim?.predicate ?? claimText).filter((item) => !subjectTokens.includes(item));
-
-  const relationSynonyms = new Set<string>(relationTokens);
-  const text = claimText.toLowerCase();
-
-  if (/(orbit|revolv|around)/i.test(text)) {
-    ["orbit", "revolve", "around", "heliocentric"].forEach((item) => relationSynonyms.add(item));
-  }
-  if (/(increase|rise|grow)/i.test(text)) {
-    ["increase", "rise", "growth", "higher"].forEach((item) => relationSynonyms.add(item));
-  }
-  if (/(decrease|fall|decline|drop)/i.test(text)) {
-    ["decrease", "fall", "decline", "lower"].forEach((item) => relationSynonyms.add(item));
-  }
-
-  return {
-    subjectTokens,
-    objectTokens,
-    relationTokens: [...relationSynonyms],
-  };
-}
-
-function hasTokenOverlap(sourceTokens: Set<string>, tokens: string[], minimumMatches = 1) {
-  let matches = 0;
-  for (const token of tokens) {
-    if (sourceTokens.has(token)) {
-      matches += 1;
-      if (matches >= minimumMatches) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
-
-function passHardRelevanceFilter(claimText: string, parsedClaim: ParsedClaim | null, sourceText: string) {
-  const sourceTokens = new Set(tokenize(sourceText));
-  const signals = extractClaimSignals(claimText, parsedClaim);
-
-  const subjectMatch = hasTokenOverlap(sourceTokens, signals.subjectTokens, 1);
-  const objectMatch = hasTokenOverlap(sourceTokens, signals.objectTokens, 1);
-  const relationMatch = hasTokenOverlap(sourceTokens, signals.relationTokens, 1);
-
-  if (parsedClaim) {
-    return subjectMatch && objectMatch && relationMatch;
-  }
-
-  // Fall back to requiring at least two dimensions when structure parsing fails.
-  const matches = [subjectMatch, objectMatch, relationMatch].filter(Boolean).length;
-  return matches >= 2;
-}
-
-function computeSourceRelevance(
-  claimText: string,
-  sourceText: string,
-  claimEmbedding: number[],
-  sourceEmbedding: number[],
-  parsedClaim: ParsedClaim | null,
-) {
-  const semanticSimilarity = cosineSimilarity(claimEmbedding, sourceEmbedding);
-  const claimSignals = extractClaimSignals(claimText, parsedClaim);
-  const sourceTokens = new Set(tokenize(sourceText));
-
-  const overlapTokens = [...claimSignals.subjectTokens, ...claimSignals.objectTokens];
-  const overlap = overlapTokens.filter((token) => sourceTokens.has(token)).length;
-  const lexicalOverlap = overlapTokens.length === 0 ? 0 : overlap / overlapTokens.length;
-  const hardMatchBoost = passHardRelevanceFilter(claimText, parsedClaim, sourceText) ? 0.08 : 0;
-  const blended = clamp01(semanticSimilarity * 0.8 + lexicalOverlap * 0.12 + hardMatchBoost);
-
-  return {
-    semanticSimilarity,
-    relevanceScore: Math.round(blended * 100),
-  };
-}
 
 function isBlockedUrl(input: string) {
   try {
@@ -793,296 +632,6 @@ async function fetchNewsSources(
   return { sources: sources.filter((source) => source.url.length > 0), failures };
 }
 
-type IndicatorConfig = {
-  code: string;
-  label: string;
-};
-
-function pickIndicatorByClaim(
-  queryText: string,
-  options: {
-    inflation: IndicatorConfig;
-    population: IndicatorConfig;
-    gdp: IndicatorConfig;
-    unemployment: IndicatorConfig;
-    health: IndicatorConfig;
-  },
-) {
-  const text = queryText.toLowerCase();
-
-  if (/(inflation|cpi|prices|cost of living)/i.test(text)) {
-    return options.inflation;
-  }
-
-  if (/(population|people|demograph)/i.test(text)) {
-    return options.population;
-  }
-
-  if (/(gdp|econom|growth|recession|output)/i.test(text)) {
-    return options.gdp;
-  }
-
-  if (/(unemploy|labor|employment|jobs)/i.test(text)) {
-    return options.unemployment;
-  }
-
-  return options.health;
-}
-
-function buildSourceReference(
-  idPrefix: string,
-  idSeed: string,
-  title: string,
-  url: string,
-  publisher: string,
-  snippet: string,
-  queryText: string,
-  parsedClaim: ParsedClaim | null,
-) {
-  const relation = evaluateRelation(queryText, parsedClaim, `${title} ${snippet}`);
-  const trustModel = buildTrustModel(url, publisher, `${title} ${snippet}`);
-  const quality = computeEvidenceQuality(title, snippet);
-  const agreement = computeAgreementScore(relation);
-
-  return {
-    id: `${idPrefix}-${hashValue(idSeed).slice(0, 8)}`,
-    title,
-    url,
-    publisher,
-    snippet,
-    relation,
-    credibility: Math.round((trustModel.trust * 0.42 + quality * 0.23 + agreement * 0.2 + (trustModel.citationSignal + trustModel.recencyScore / 100) * 0.15) * 100),
-    tier: trustModel.tierLabel,
-    domainAuthorityTier: trustModel.domainAuthorityTier,
-    domainAuthority: Math.round(trustModel.domainAuthority * 100),
-    institutionalTrust: Math.round(trustModel.institutionalTrust * 100),
-    citationSignal: Math.round(trustModel.citationSignal * 100),
-    recencyScore: trustModel.recencyScore,
-    agreementScore: Math.round(agreement * 100),
-  } satisfies SourceReference;
-}
-
-async function fetchWorldBankSource(
-  queryText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<{ source?: SourceReference; failure?: string }> {
-  const indicator = pickIndicatorByClaim(queryText, {
-    inflation: { code: "FP.CPI.TOTL.ZG", label: "Inflation, consumer prices (annual %)" },
-    population: { code: "SP.POP.TOTL", label: "Population, total" },
-    gdp: { code: "NY.GDP.MKTP.KD.ZG", label: "GDP growth (annual %)" },
-    unemployment: { code: "SL.UEM.TOTL.ZS", label: "Unemployment, total (% of labor force)" },
-    health: { code: "SH.XPD.CHEX.GD.ZS", label: "Current health expenditure (% of GDP)" },
-  });
-
-  try {
-    const response = await fetchWithTimeout(
-      `https://api.worldbank.org/v2/country/WLD/indicator/${indicator.code}?format=json&mrv=1`,
-    );
-
-    if (!response.ok) {
-      return { failure: `World Bank API failed with status ${response.status}.` };
-    }
-
-    const payload = (await response.json()) as [unknown, Array<{ date?: string; value?: number | null }>];
-    const latest = payload?.[1]?.[0];
-    if (!latest || latest.value == null) {
-      return { failure: "World Bank API returned no recent values." };
-    }
-
-    const year = latest.date?.trim() || "recent year";
-    const snippet = `${indicator.label} (World): ${latest.value} in ${year}.`;
-
-    return {
-      source: buildSourceReference(
-        "world-bank",
-        `${indicator.code}-${year}`,
-        `World Bank: ${indicator.label}`,
-        `https://data.worldbank.org/indicator/${indicator.code}`,
-        "World Bank",
-        snippet,
-        queryText,
-        parsedClaim,
-      ),
-    };
-  } catch {
-    return { failure: "World Bank request timed out or failed." };
-  }
-}
-
-async function fetchWhoSource(
-  queryText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<{ source?: SourceReference; failure?: string }> {
-  const searchTerms = tokenize(queryText);
-  const bestTerm = searchTerms.find((term) => term.length >= 5) ?? "health";
-  const filter = encodeURIComponent(`contains(IndicatorName,'${bestTerm}')`);
-
-  try {
-    const response = await fetchWithTimeout(
-      `https://ghoapi.azureedge.net/api/Indicator?$top=1&$filter=${filter}`,
-    );
-
-    if (!response.ok) {
-      return { failure: `WHO API failed with status ${response.status}.` };
-    }
-
-    const payload = (await response.json()) as {
-      value?: Array<{ IndicatorCode?: string; IndicatorName?: string }>;
-    };
-
-    const indicator = payload.value?.[0];
-    if (!indicator?.IndicatorCode || !indicator.IndicatorName) {
-      return { failure: "WHO API returned no matching indicator." };
-    }
-
-    const snippet = `${indicator.IndicatorName} is available via the WHO Global Health Observatory API.`;
-
-    return {
-      source: buildSourceReference(
-        "who",
-        indicator.IndicatorCode,
-        `WHO GHO: ${indicator.IndicatorName}`,
-        `https://www.who.int/data/gho/data/indicators/indicator-details/GHO/${encodeURIComponent(indicator.IndicatorCode)}`,
-        "WHO",
-        snippet,
-        queryText,
-        parsedClaim,
-      ),
-    };
-  } catch {
-    return { failure: "WHO request timed out or failed." };
-  }
-}
-
-async function fetchImfSource(
-  queryText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<{ source?: SourceReference; failure?: string }> {
-  const indicator = pickIndicatorByClaim(queryText, {
-    inflation: { code: "PCPIPCH", label: "Inflation rate, average consumer prices" },
-    population: { code: "LP", label: "Population" },
-    gdp: { code: "NGDP_RPCH", label: "Real GDP growth" },
-    unemployment: { code: "LUR", label: "Unemployment rate" },
-    health: { code: "GGXWDG_NGDP", label: "Public spending" },
-  });
-
-  try {
-    const response = await fetchWithTimeout(
-      `https://www.imf.org/external/datamapper/api/v1/${indicator.code}?WEOADV`,
-    );
-
-    if (!response.ok) {
-      return { failure: `IMF API failed with status ${response.status}.` };
-    }
-
-    const payload = (await response.json()) as {
-      values?: Record<string, Record<string, Record<string, number>>>;
-    };
-
-    const byIndicator = payload.values?.[indicator.code];
-    const series = byIndicator?.WEOADV;
-    if (!series) {
-      return { failure: "IMF API returned no dataset values." };
-    }
-
-    const years = Object.keys(series).sort((a, b) => Number(b) - Number(a));
-    const latestYear = years[0];
-    const latestValue = latestYear ? series[latestYear] : undefined;
-    if (!latestYear || latestValue == null) {
-      return { failure: "IMF API returned an empty time series." };
-    }
-
-    const snippet = `${indicator.label} (Advanced Economies): ${latestValue} in ${latestYear}.`;
-
-    return {
-      source: buildSourceReference(
-        "imf",
-        `${indicator.code}-${latestYear}`,
-        `IMF DataMapper: ${indicator.label}`,
-        `https://www.imf.org/external/datamapper/${indicator.code}/WEOADV`,
-        "IMF",
-        snippet,
-        queryText,
-        parsedClaim,
-      ),
-    };
-  } catch {
-    return { failure: "IMF request timed out or failed." };
-  }
-}
-
-async function fetchUnSdgSource(
-  queryText: string,
-  parsedClaim: ParsedClaim | null,
-): Promise<{ source?: SourceReference; failure?: string }> {
-  try {
-    const response = await fetchWithTimeout("https://unstats.un.org/sdgs/UNSDGAPI/v1/sdg/Series/List");
-
-    if (!response.ok) {
-      return { failure: `UN SDG API failed with status ${response.status}.` };
-    }
-
-    const payload = (await response.json()) as {
-      data?: Array<{ code?: string; description?: string }>;
-    };
-
-    const terms = tokenize(queryText);
-    const matched = payload.data?.find((entry) => {
-      const text = `${entry.code ?? ""} ${entry.description ?? ""}`.toLowerCase();
-      return terms.some((term) => text.includes(term));
-    });
-
-    const fallback = payload.data?.[0];
-    const series = matched ?? fallback;
-
-    if (!series?.code || !series.description) {
-      return { failure: "UN SDG API returned no series metadata." };
-    }
-
-    const snippet = `${series.description} (series ${series.code}) is available through the UN SDG API catalog.`;
-
-    return {
-      source: buildSourceReference(
-        "un-sdg",
-        series.code,
-        `UN SDG API: ${series.code}`,
-        `https://unstats.un.org/sdgs/metadata/?Text=${encodeURIComponent(series.code)}`,
-        "United Nations",
-        snippet,
-        queryText,
-        parsedClaim,
-      ),
-    };
-  } catch {
-    return { failure: "UN SDG request timed out or failed." };
-  }
-}
-
-async function fetchInstitutionalApiSources(
-  queryText: string,
-  parsedClaim: ParsedClaim | null,
-  claimType: ClaimType,
-): Promise<{ sources: SourceReference[]; failures: string[] }> {
-  if (!CLAIM_RETRIEVAL_PROFILE[claimType].includeInstitutional) {
-    return {
-      sources: [],
-      failures: ["Institutional retrieval skipped for subjective/non-institutional claim type."],
-    };
-  }
-
-  const settled = await Promise.all([
-    fetchWorldBankSource(queryText, parsedClaim),
-    fetchWhoSource(queryText, parsedClaim),
-    fetchImfSource(queryText, parsedClaim),
-    fetchUnSdgSource(queryText, parsedClaim),
-  ]);
-
-  const sources = settled.flatMap((item) => (item.source ? [item.source] : []));
-  const failures = settled.flatMap((item) => (item.failure ? [item.failure] : []));
-
-  return { sources, failures };
-}
-
 async function filterSourcesByRelevance(
   queryText: string,
   parsedClaim: ParsedClaim | null,
@@ -1290,7 +839,12 @@ async function retrieveAndFilterSources(
   const [newsData, groundingData, institutionalData] = await Promise.all([
     fetchNewsSources(claimText, parsedClaim, claimType, queryVariants, assessment),
     fetchWikipediaAndWikidataSources(claimText, parsedClaim),
-    fetchInstitutionalApiSources(claimText, parsedClaim, claimType),
+    fetchInstitutionalApiSources(
+      claimText,
+      parsedClaim,
+      claimType,
+      CLAIM_RETRIEVAL_PROFILE[claimType].includeInstitutional,
+    ),
   ]);
 
   const fetchedSources = dedupeSources([
@@ -1964,6 +1518,7 @@ const runAnalysisPipeline = createRunAnalysisPipeline({
   commonKnowledgePresidentOverride,
   commonKnowledgePrimeMinisterOverride,
   commonKnowledgeHeadquartersOverride,
+  commonKnowledgeAiFallbackOverride,
 });
 
 export async function createAnalysis(input: string, userId?: string) {
@@ -2291,6 +1846,7 @@ export const __testHooks = {
   commonKnowledgePresidentOverride,
   commonKnowledgePrimeMinisterOverride,
   commonKnowledgeHeadquartersOverride,
+  commonKnowledgeAiFallbackOverride,
   scoreEvidence,
   generateSubClaimStatements,
 };

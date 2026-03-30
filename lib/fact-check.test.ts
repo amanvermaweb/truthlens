@@ -20,6 +20,8 @@ let commonKnowledgeScienceIsAOverride: (typeof import("./fact-check"))["__testHo
 let commonKnowledgeAtomicNumberOverride: (typeof import("./fact-check"))["__testHooks"]["commonKnowledgeAtomicNumberOverride"];
 let commonKnowledgeBoilingPointOverride: (typeof import("./fact-check"))["__testHooks"]["commonKnowledgeBoilingPointOverride"];
 let commonKnowledgeUltraBasicOverride: (typeof import("./fact-check"))["__testHooks"]["commonKnowledgeUltraBasicOverride"];
+let commonKnowledgeCapitalOverride: (typeof import("./fact-check"))["__testHooks"]["commonKnowledgeCapitalOverride"];
+let commonKnowledgeAiFallbackOverride: (typeof import("./fact-check"))["__testHooks"]["commonKnowledgeAiFallbackOverride"];
 
 beforeAll(async () => {
   const factCheckModule = await import("./fact-check");
@@ -37,6 +39,8 @@ beforeAll(async () => {
   commonKnowledgeAtomicNumberOverride = factCheckModule.__testHooks.commonKnowledgeAtomicNumberOverride;
   commonKnowledgeBoilingPointOverride = factCheckModule.__testHooks.commonKnowledgeBoilingPointOverride;
   commonKnowledgeUltraBasicOverride = factCheckModule.__testHooks.commonKnowledgeUltraBasicOverride;
+  commonKnowledgeCapitalOverride = factCheckModule.__testHooks.commonKnowledgeCapitalOverride;
+  commonKnowledgeAiFallbackOverride = factCheckModule.__testHooks.commonKnowledgeAiFallbackOverride;
 });
 
 function source(partial: Partial<SourceReference>): SourceReference {
@@ -107,6 +111,220 @@ describe("fact-check scoring regressions", () => {
     expect(result?.sources.length).toBeGreaterThanOrEqual(1);
 
     fetchMock.mockRestore();
+  });
+
+  it("resolves capital claims via Wikidata-backed common-knowledge override", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ search: [{ id: "Q668", label: "India" }] }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            entities: {
+              Q668: {
+                claims: {
+                  P36: [
+                    {
+                      rank: "normal",
+                      mainsnak: { datavalue: { value: { id: "Q987" } } },
+                    },
+                  ],
+                },
+                labels: { en: { value: "India" } },
+              },
+            },
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            entities: {
+              Q987: {
+                labels: { en: { value: "New Delhi" } },
+              },
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+
+    const result = await commonKnowledgeCapitalOverride(
+      "The capital of India is New Delhi",
+      { subject: "capital of India", predicate: "is", object: "New Delhi" },
+    );
+
+    expect(result?.verdict).toBe("True");
+    expect(result?.confidence).toBeGreaterThanOrEqual(90);
+
+    fetchMock.mockRestore();
+  });
+
+  it("contradicts incorrect capital claims via Wikidata-backed common-knowledge override", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ search: [{ id: "Q142", label: "France" }] }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            entities: {
+              Q142: {
+                claims: {
+                  P36: [
+                    {
+                      rank: "normal",
+                      mainsnak: { datavalue: { value: { id: "Q90" } } },
+                    },
+                  ],
+                },
+                labels: { en: { value: "France" } },
+              },
+            },
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            entities: {
+              Q90: {
+                labels: { en: { value: "Paris" } },
+              },
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+
+    const result = await commonKnowledgeCapitalOverride(
+      "The capital of France is Marseille",
+      { subject: "capital of France", predicate: "is", object: "Marseille" },
+    );
+
+    expect(result?.verdict).toBe("False");
+    expect(result?.confidence).toBeGreaterThanOrEqual(90);
+
+    fetchMock.mockRestore();
+  });
+
+  it("uses AI fallback only when response includes diverse valid citations", async () => {
+    const originalApiKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    can_resolve: true,
+                    verdict: "True",
+                    confidence: 95,
+                    explanation: "Reference sources consistently describe Canberra as Australia's capital.",
+                    sources: [
+                      {
+                        title: "Australia - World Factbook",
+                        url: "https://www.cia.gov/the-world-factbook/countries/australia/",
+                        publisher: "CIA World Factbook",
+                        snippet: "The capital of Australia is Canberra.",
+                        relation: "supports",
+                      },
+                      {
+                        title: "Australia - Encyclopaedia Britannica",
+                        url: "https://www.britannica.com/place/Australia",
+                        publisher: "Encyclopaedia Britannica",
+                        snippet: "Canberra is the national capital of Australia.",
+                        relation: "supports",
+                      },
+                    ],
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+
+    const result = await commonKnowledgeAiFallbackOverride(
+      "The capital of Australia is Canberra",
+      { subject: "capital of Australia", predicate: "is", object: "Canberra" },
+    );
+
+    expect(result?.verdict).toBe("True");
+    expect(result?.sources.length).toBeGreaterThanOrEqual(2);
+    expect(result?.confidence).toBeLessThanOrEqual(89);
+
+    fetchMock.mockRestore();
+    process.env.OPENAI_API_KEY = originalApiKey;
+  });
+
+  it("rejects AI fallback output when citations are not diverse", async () => {
+    const originalApiKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    can_resolve: true,
+                    verdict: "False",
+                    confidence: 88,
+                    explanation: "Claim contradicts known references.",
+                    sources: [
+                      {
+                        title: "Wikipedia - France",
+                        url: "https://en.wikipedia.org/wiki/France",
+                        publisher: "Wikipedia",
+                        snippet: "Paris is the capital of France.",
+                        relation: "contradicts",
+                      },
+                      {
+                        title: "Wikipedia - Paris",
+                        url: "https://en.wikipedia.org/wiki/Paris",
+                        publisher: "Wikipedia",
+                        snippet: "Paris is the capital and most populous city of France.",
+                        relation: "contradicts",
+                      },
+                    ],
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+
+    const result = await commonKnowledgeAiFallbackOverride(
+      "The capital of France is Lyon",
+      { subject: "capital of France", predicate: "is", object: "Lyon" },
+    );
+
+    expect(result).toBeNull();
+
+    fetchMock.mockRestore();
+    process.env.OPENAI_API_KEY = originalApiKey;
   });
 
   it("returns false for incorrect CEO role claims via common-knowledge override", async () => {
@@ -742,25 +960,22 @@ describe("fact-check scoring regressions", () => {
     fetchMock.mockRestore();
   });
 
-  it("resolves water boiling point at sea level", () => {
+  it("does not use deprecated static boiling-point override", () => {
     const result = commonKnowledgeBoilingPointOverride(
       "Water boils at 100°C at sea level",
       { subject: "Water", predicate: "boils", object: "at 100°C at sea level" },
     );
 
-    expect(result?.verdict).toBe("True");
-    expect(result?.confidence).toBeGreaterThanOrEqual(95);
-    expect(result?.sources.length).toBeGreaterThanOrEqual(2);
+    expect(result).toBeNull();
   });
 
-  it("contradicts incorrect water boiling point at sea level", () => {
+  it("does not use deprecated static boiling-point contradiction path", () => {
     const result = commonKnowledgeBoilingPointOverride(
       "Water boils at 95 C at sea level",
       { subject: "Water", predicate: "boils", object: "at 95 C at sea level" },
     );
 
-    expect(result?.verdict).toBe("False");
-    expect(result?.confidence).toBeGreaterThanOrEqual(90);
+    expect(result).toBeNull();
   });
 
   it("does not apply water boiling point override without pressure context", () => {
@@ -769,6 +984,11 @@ describe("fact-check scoring regressions", () => {
       { subject: "Water", predicate: "boils", object: "at 100 C" },
     );
 
+    expect(result).toBeNull();
+  });
+
+  it("does not use deprecated static ultra-basic phrase catalog", () => {
+    const result = commonKnowledgeUltraBasicOverride("The Sun is a star");
     expect(result).toBeNull();
   });
 
@@ -1042,13 +1262,11 @@ describe("fact-check scoring regressions", () => {
     expect(result.confidence).toBeGreaterThanOrEqual(85);
   });
 
-  it("matches ultra-basic fact overrides for canonical science claims", () => {
+  it("does not use deprecated ultra-basic static override for canonical science claims", () => {
     const positive = commonKnowledgeUltraBasicOverride("Earth revolves around Sun");
     const negative = commonKnowledgeUltraBasicOverride("Sun is a planet");
 
-    expect(positive?.verdict).toBe("True");
-    expect(positive?.confidence).toBeGreaterThanOrEqual(95);
-    expect(negative?.verdict).toBe("False");
-    expect(negative?.confidence).toBeGreaterThanOrEqual(90);
+    expect(positive).toBeNull();
+    expect(negative).toBeNull();
   });
 });
