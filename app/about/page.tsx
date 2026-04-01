@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 export default function AboutPage() {
   return (
     <section className="mx-auto w-full max-w-240 px-4 pb-20 pt-10 sm:px-6">
@@ -12,23 +14,10 @@ export default function AboutPage() {
           checks, and contradiction detection to provide concise, explainable
           verdicts.
         </p>
-        <div className="mt-8 grid gap-4 sm:grid-cols-2">
-          <div className="card-surface p-5">
-            <h2 className="title-sm text-high">Methodology</h2>
-            <p className="body-md mt-2 text-muted">
-              Weighted source ranking, linguistic anomaly detection, and
-              temporal consistency checks.
-            </p>
-          </div>
-          <div className="card-surface p-5">
-            <h2 className="title-sm text-high">Audience</h2>
-            <p className="body-md mt-2 text-muted">
-              Policy researchers, investigative journalists, and market analysts
-              requiring high-confidence verification.
-            </p>
-          </div>
-        </div>
       </article>
+        <p className="mt-6 text-base text-center leading-7 text-muted">
+          Made with ❤️ by <Link href="https://github.com/amanvermaweb/" className="underline">Aman Verma</Link>
+        </p>
     </section>
   );
 }
